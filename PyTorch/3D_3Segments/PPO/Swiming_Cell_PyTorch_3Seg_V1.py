@@ -1,0 +1,2830 @@
+"""
+Cellule nageuse 3D — PPO continu, réseau Actor-Critic unique et IHM Tkinter.
+
+Cette expérience pédagogique étend la cellule à flagelle dans un cube 3D :
+
+    - position, vitesse, orientation et rotation en trois dimensions ;
+    - extrémité blanche utilisée comme effecteur de contact avec la cible ;
+    - diagnostic séparant progression du centre, de la pointe et du contact ;
+    - détection d'un dépassement raté par inversion de la vitesse radiale ;
+    - flagelle à trois segments, chaque articulation ayant deux axes ;
+    - six angles articulaires commandés directement par le réseau neuronal ;
+    - aucune onde, phase ou commande de virage n'est imposée au moteur ;
+    - Actor continu à six sorties, Critic scalaire V(s) ;
+    - apprentissage PPO avec GAE dans plusieurs mondes parallèles ;
+    - curriculum automatique puis évaluation dans tout le volume ;
+    - projection perspective réalisée directement dans Tkinter.
+
+La physique représente une traînée visqueuse anisotrope et les couples produits
+par le flagelle. Ce n'est pas un solveur de mécanique des fluides.
+
+Dépendance :
+    py -m pip install torch
+
+Lancement :
+    py cellule_flagelle_3d_ppo_pytorch_full_rn.py
+
+Test de la physique sans PyTorch :
+    py cellule_flagelle_3d_ppo_pytorch_full_rn.py --test-physique
+
+Entraînement sans interface :
+    py cellule_flagelle_3d_ppo_pytorch_full_rn.py --headless 20
+
+Sauvegardes :
+    sauvegardes_pytorch_3d_full_rn/AAAAMMJJ_HHMMSS/
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import csv
+import json
+import math
+import random
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.distributions import Normal
+
+    TORCH_AVAILABLE = True
+    TORCH_IMPORT_ERROR = ""
+except ModuleNotFoundError as exc:
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    Normal = None  # type: ignore[assignment]
+    TORCH_AVAILABLE = False
+    TORCH_IMPORT_ERROR = str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CANVAS_WIDTH = 1760
+CANVAS_HEIGHT = 930
+WORLD_HALF_SIZE = 260.0
+WORLD_MARGIN = 24.0
+
+BODY_HALF_LENGTH = 20.0
+BODY_RADIUS = 12.0
+SEGMENT_COUNT = 3
+
+# Morphologie simplifiée : le flagelle s'amincit en s'éloignant du corps.
+# La longueur totale reste égale à celle de l'ancienne version (3 x 32 = 96),
+# afin de modifier la répartition de l'effort sans allonger le flagelle.
+SEGMENT_LENGTHS = (39.0, 32.0, 25.0)
+SEGMENT_FORCE_WEIGHTS = (1.00, 0.78, 0.58)
+
+TARGET_RADIUS = 11.0
+# La cible est capturée lorsque l'extrémité blanche de la tête entre dans sa
+# sphère. Cette géométrie favorise une approche axiale de la cellule.
+CAPTURE_RADIUS = TARGET_RADIUS
+MIN_TARGET_DISTANCE = 150.0
+MAX_TARGET_DISTANCE = 390.0
+
+# Deux courbures par articulation : lacet local et tangage local.
+JOINT_LIMITS = (
+    math.radians(25.0),
+    math.radians(35.0),
+    math.radians(40.0),
+)
+MAX_JOINT_SPEED = 0.16
+JOINT_SERVO_GAIN = 0.28
+JOINT_DAMPING = 0.60
+
+# Les six sorties du RN sont directement les angles cibles normalisés :
+# [lacet1, tangage1, lacet2, tangage2, lacet3, tangage3]. Un filtrage léger
+# protège la physique des sauts instantanés sans fournir de rythme au réseau.
+DIRECT_TARGET_RETENTION = 0.65
+
+# Modèle visqueux simplifié. La traînée latérale supérieure à la traînée
+# axiale permet à un cycle articulaire non réciproque de produire une poussée.
+DRAG_PARALLEL = 0.018
+DRAG_PERPENDICULAR = 0.075
+SHAPE_PROPULSION = 3.20
+FORCE_TO_SPEED = 1.65
+TORQUE_TO_ROTATION = 0.00115
+LINEAR_DAMPING = 0.38
+ANGULAR_DAMPING = 0.48
+MAX_CELL_SPEED = 2.30
+MAX_CELL_ROTATION = 0.055
+
+TIMEOUT_BASE = 500
+TIMEOUT_PER_UNIT = 5.0
+
+PROGRESS_REWARD = 3.00
+# Lorsque la cible est sur le côté ou derrière, une rotation utile doit pouvoir
+# compenser l'éloignement temporaire imposé par l'arc du demi-tour. Le RN gagne
+# uniquement sur la variation d'alignement : rester orienté ne rapporte rien.
+# La distance tête-cible récompense déjà une partie du redressement. Ce petit
+# complément reste utile lorsque la cible est lointaine, sans payer deux fois
+# trop fortement la même rotation.
+ALIGNMENT_PROGRESS_REWARD = 0.80
+CAPTURE_REWARD = 4.0
+TIME_PENALTY = 0.0012
+ENERGY_PENALTY = 0.00035
+WALL_PENALTY = 0.055
+
+# Phase terminale exprimée en espace restant entre les deux surfaces. Près du
+# contact, la progression radiale doit redevenir prioritaire sur l'alignement.
+TERMINAL_GUIDANCE_GAP = 90.0
+# Une part de l'alignement reste active au contact : le point blanc doit entrer
+# dans la sphère avec l'axe du corps approximativement dirigé vers son centre.
+TERMINAL_ALIGNMENT_MIN_FACTOR = 0.25
+
+# Un dépassement raté est détecté quand la vitesse radiale du point de contact
+# passe de positive à négative sans intersection avec la sphère cible.
+NEAR_MISS_MAX_GAP = 30.0
+NEAR_MISS_MIN_APPROACH_SPEED = 0.010
+NEAR_MISS_PENALTY = 0.050
+OVERSHOOT_PENALTY = 0.0060
+MAX_CONTACT_SPEED = MAX_CELL_SPEED + BODY_HALF_LENGTH * MAX_CELL_ROTATION
+
+# Anticipation : le réseau doit commencer à réduire sa vitesse avant que la
+# pointe dépasse la cible, malgré l'inertie du corps et des articulations.
+ANTICIPATION_MAX_GAP = 55.0
+ANTICIPATION_HORIZON_STEPS = 18.0
+ANTICIPATION_MIN_APPROACH_SPEED = 0.020
+ANTICIPATION_PENALTY = 0.0045
+
+# Une trajectoire tangentielle persistante près de la cible est une orbite.
+# Le carré laisse libres les approches courbes et cible surtout le mouvement
+# presque perpendiculaire à la direction de la cible.
+ORBIT_PENALTY = 0.0040
+ORBIT_MIN_HEAD_SPEED = 0.020
+
+# La récompense de rotation est complète au-delà de 60° d'erreur et disparaît
+# progressivement quand l'erreur descend de 60° à 25°. La progression vers la
+# cible reprend alors naturellement le rôle principal.
+TURN_REWARD_FULL_BELOW = math.cos(math.radians(60.0))
+TURN_REWARD_ZERO_ABOVE = math.cos(math.radians(25.0))
+
+# Trente-six pas laissent aux articulations le temps de quitter leur état
+# initial. Une cellule qui tourne réellement n'est pas considérée immobile.
+STAGNATION_SPEED = 0.035
+STAGNATION_ROTATION = 0.0025
+STAGNATION_GRACE_STEPS = 36
+STAGNATION_PENALTY = 0.0080
+
+# 3 direction pointe-cible + 1 marge + 1 vitesse radiale
+# + 3 vitesse + 3 rotation
+# + 6 angles + 6 vitesses + 6 angles cibles filtrés.
+OBSERVATION_SIZE = 29
+ACTION_SIZE = 6
+HIDDEN_SIZE = 128
+
+ENVIRONMENT_COUNT = 12
+ROLLOUT_STEPS = 96
+PPO_EPOCHS = 4
+MINIBATCH_SIZE = 256
+GAMMA = 0.99
+GAE_LAMBDA = 0.95
+PPO_CLIP = 0.20
+VALUE_CLIP = 0.20
+LEARNING_RATE = 3.0e-4
+ENTROPY_START = 0.010
+ENTROPY_END = 0.0015
+ENTROPY_DECAY_UPDATES = 4500
+VALUE_COEFFICIENT = 0.50
+MAX_GRADIENT_NORM = 0.50
+TARGET_KL = 0.030
+
+SESSION_FORMAT = "cellule-ppo-pytorch-3d-full-rn-v1"
+SESSION_FILENAME = "checkpoint_3d_full_rn.pt"
+CONFIG_FILENAME = "configuration_3d_full_rn.json"
+HISTORY_FILENAME = "historique_3d_full_rn.csv"
+
+CURRICULUM_NAMES = (
+    "CIBLE DANS UN CÔNE AVANT",
+    "CIBLE DANS L'HÉMISPHÈRE AVANT",
+    "CIBLE DANS TOUT LE CUBE",
+)
+
+
+# ---------------------------------------------------------------------------
+# Outils mathématiques 3D
+# ---------------------------------------------------------------------------
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def contact_anticipation(contact_gap: float, radial_speed: float) -> tuple[float, float]:
+    """Renvoie le temps estimé avant contact et un risque dans [0, 1]."""
+    if (
+        contact_gap <= 0.0
+        or radial_speed <= ANTICIPATION_MIN_APPROACH_SPEED
+    ):
+        return 999.9, 0.0
+    time_to_contact = min(999.9, contact_gap / radial_speed)
+    proximity = clamp(
+        1.0 - contact_gap / ANTICIPATION_MAX_GAP,
+        0.0,
+        1.0,
+    )
+    urgency = clamp(
+        1.0 - time_to_contact / ANTICIPATION_HORIZON_STEPS,
+        0.0,
+        1.0,
+    )
+    return time_to_contact, proximity * urgency
+
+
+def turning_reward_gate(alignment: float) -> float:
+    """Poids de la récompense de rotation selon l'erreur d'orientation."""
+    if alignment <= TURN_REWARD_FULL_BELOW:
+        return 1.0
+    if alignment >= TURN_REWARD_ZERO_ABOVE:
+        return 0.0
+    return (
+        TURN_REWARD_ZERO_ABOVE - alignment
+    ) / (TURN_REWARD_ZERO_ABOVE - TURN_REWARD_FULL_BELOW)
+
+
+@dataclass
+class Vec3:
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+
+    def __add__(self, other: "Vec3") -> "Vec3":
+        return Vec3(self.x + other.x, self.y + other.y, self.z + other.z)
+
+    def __sub__(self, other: "Vec3") -> "Vec3":
+        return Vec3(self.x - other.x, self.y - other.y, self.z - other.z)
+
+    def __mul__(self, scalar: float) -> "Vec3":
+        return Vec3(self.x * scalar, self.y * scalar, self.z * scalar)
+
+    __rmul__ = __mul__
+
+    def __truediv__(self, scalar: float) -> "Vec3":
+        return Vec3(self.x / scalar, self.y / scalar, self.z / scalar)
+
+    def dot(self, other: "Vec3") -> float:
+        return self.x * other.x + self.y * other.y + self.z * other.z
+
+    def cross(self, other: "Vec3") -> "Vec3":
+        return Vec3(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
+
+    def length(self) -> float:
+        return math.sqrt(self.dot(self))
+
+    def normalized(self) -> "Vec3":
+        magnitude = self.length()
+        return self / magnitude if magnitude > 1e-12 else Vec3()
+
+    def limited(self, maximum: float) -> "Vec3":
+        magnitude = self.length()
+        return self * (maximum / magnitude) if magnitude > maximum else self
+
+
+@dataclass
+class Quaternion:
+    """Quaternion unitaire transformant le repère du corps vers le monde."""
+
+    w: float = 1.0
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+
+    def __mul__(self, other: "Quaternion") -> "Quaternion":
+        return Quaternion(
+            self.w * other.w - self.x * other.x - self.y * other.y - self.z * other.z,
+            self.w * other.x + self.x * other.w + self.y * other.z - self.z * other.y,
+            self.w * other.y - self.x * other.z + self.y * other.w + self.z * other.x,
+            self.w * other.z + self.x * other.y - self.y * other.x + self.z * other.w,
+        )
+
+    def normalized(self) -> "Quaternion":
+        magnitude = math.sqrt(
+            self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z
+        )
+        if magnitude < 1e-12:
+            return Quaternion()
+        return Quaternion(
+            self.w / magnitude,
+            self.x / magnitude,
+            self.y / magnitude,
+            self.z / magnitude,
+        )
+
+    def conjugate(self) -> "Quaternion":
+        return Quaternion(self.w, -self.x, -self.y, -self.z)
+
+    def rotate(self, vector: Vec3) -> Vec3:
+        pure = Quaternion(0.0, vector.x, vector.y, vector.z)
+        result = self * pure * self.conjugate()
+        return Vec3(result.x, result.y, result.z)
+
+    def inverse_rotate(self, vector: Vec3) -> Vec3:
+        return self.conjugate().rotate(vector)
+
+    @staticmethod
+    def from_axis_angle(axis: Vec3, angle: float) -> "Quaternion":
+        unit = axis.normalized()
+        half = 0.5 * angle
+        sine = math.sin(half)
+        return Quaternion(math.cos(half), unit.x * sine, unit.y * sine, unit.z * sine)
+
+    @staticmethod
+    def from_rotation_vector(rotation: Vec3) -> "Quaternion":
+        angle = rotation.length()
+        return (
+            Quaternion.from_axis_angle(rotation / angle, angle)
+            if angle > 1e-12
+            else Quaternion()
+        )
+
+
+def random_unit_vector(rng: random.Random) -> Vec3:
+    z = rng.uniform(-1.0, 1.0)
+    azimuth = rng.uniform(0.0, 2.0 * math.pi)
+    radius = math.sqrt(max(0.0, 1.0 - z * z))
+    return Vec3(radius * math.cos(azimuth), radius * math.sin(azimuth), z)
+
+
+def moving_average(values: list[float], window: int = 20) -> list[float]:
+    result: list[float] = []
+    running = 0.0
+    for index, value in enumerate(values):
+        running += value
+        if index >= window:
+            running -= values[index - window]
+        result.append(running / min(index + 1, window))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Environnement physique 3D
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CellState:
+    position: Vec3 = field(default_factory=Vec3)
+    orientation: Quaternion = field(default_factory=Quaternion)
+    velocity: Vec3 = field(default_factory=Vec3)
+    angular_velocity: Vec3 = field(default_factory=Vec3)
+    # Pour chaque articulation : [lacet local, tangage local].
+    joint_angles: list[list[float]] = field(
+        default_factory=lambda: [[0.0, 0.0] for _ in range(SEGMENT_COUNT)]
+    )
+    joint_speeds: list[list[float]] = field(
+        default_factory=lambda: [[0.0, 0.0] for _ in range(SEGMENT_COUNT)]
+    )
+    # Dernières cibles articulaires après filtrage. Elles sont observées par le
+    # RN pour que le système reste markovien malgré le retard de l'actionneur.
+    motor_target_state: list[float] = field(
+        default_factory=lambda: [0.0] * ACTION_SIZE
+    )
+
+
+@dataclass
+class FlagellumGeometry:
+    points: list[Vec3]
+    middles: list[Vec3]
+    tangents: list[Vec3]
+
+
+@dataclass
+class ContactGeometry:
+    """Géométrie du contact entre la pointe blanche et la sphère cible."""
+
+    point: Vec3
+    direction: Vec3
+    surface_distance: float
+    gap: float
+    center_distance: float
+    tip_distance: float
+
+
+@dataclass
+class EpisodeMetrics:
+    reward: float
+    captured: bool
+    steps: int
+    initial_distance: float
+    normalized_time: float
+    effective_speed: float
+    path_efficiency: float
+    energy: float
+    wall_hits: int
+    lateral_motion: float
+
+
+@dataclass
+class Telemetry:
+    segment_forces: list[Vec3] = field(
+        default_factory=lambda: [Vec3() for _ in range(SEGMENT_COUNT)]
+    )
+    propulsion: Vec3 = field(default_factory=Vec3)
+    # Vitesse du centre, utilisée par la mécanique du corps.
+    velocity: Vec3 = field(default_factory=Vec3)
+    # Vitesse de la pointe, conservée pour distinguer translation et cabrage.
+    head_velocity: Vec3 = field(default_factory=Vec3)
+    # Vitesse du point blanc utilisé pour le contact avec la cible.
+    contact_velocity: Vec3 = field(default_factory=Vec3)
+    contact_point: Vec3 = field(default_factory=Vec3)
+    target_direction: Vec3 = field(default_factory=Vec3)
+    wall_reaction: Vec3 = field(default_factory=Vec3)
+    torque: Vec3 = field(default_factory=Vec3)
+    reward: float = 0.0
+    reward_progress: float = 0.0
+    reward_alignment: float = 0.0
+    reward_time: float = 0.0
+    reward_energy: float = 0.0
+    reward_orbit: float = 0.0
+    reward_anticipation: float = 0.0
+    reward_near_miss: float = 0.0
+    reward_overshoot: float = 0.0
+    reward_stagnation: float = 0.0
+    reward_wall: float = 0.0
+    reward_capture: float = 0.0
+    distance_to_target: float = 0.0
+    center_distance: float = 0.0
+    tip_distance: float = 0.0
+    contact_gap: float = 0.0
+    radial_speed: float = 0.0
+    time_to_contact: float = 999.9
+    anticipation_risk: float = 0.0
+    center_progress: float = 0.0
+    tip_progress: float = 0.0
+    contact_progress: float = 0.0
+    useful_speed: float = 0.0
+    lateral_speed: float = 0.0
+    alignment: float = 0.0
+    bearing_degrees: float = 0.0
+    tangential_fraction: float = 0.0
+    terminal_proximity: float = 0.0
+    alignment_distance_factor: float = 1.0
+    target_behind: bool = False
+    near_miss: bool = False
+    requested_action: list[float] = field(default_factory=lambda: [0.0] * ACTION_SIZE)
+    action: list[float] = field(default_factory=lambda: [0.0] * ACTION_SIZE)
+    captured: bool = False
+    timed_out: bool = False
+
+
+@dataclass
+class StepOutcome:
+    reward: float
+    terminal: bool
+    metrics: EpisodeMetrics | None
+
+
+class CellWorld3D:
+    """Cube 3D et dynamique visqueuse simplifiée, indépendants de PyTorch."""
+
+    def __init__(self, seed: int, curriculum_level: int = 0) -> None:
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.curriculum_level = int(clamp(curriculum_level, 0, 2))
+        self.cell = CellState()
+        self.target = self._sample_target()
+        initial_contact = self.contact_geometry()
+        self.previous_distance = initial_contact.gap
+        self.previous_radial_speed = 0.0
+        self.initial_distance = max(self.previous_distance, 1.0)
+        self.episode_step = 0
+        self.episode_reward = 0.0
+        self.episode_path_length = 0.0
+        self.episode_energy = 0.0
+        self.episode_wall_hits = 0
+        self.episode_lateral_motion = 0.0
+        self.total_steps = 0
+        self.total_captures = 0
+        self.total_timeouts = 0
+        self.trajectory = [Vec3()]
+        self.telemetry = Telemetry(
+            contact_point=initial_contact.point,
+            target_direction=initial_contact.direction,
+            distance_to_target=initial_contact.surface_distance,
+            center_distance=initial_contact.center_distance,
+            tip_distance=initial_contact.tip_distance,
+            contact_gap=initial_contact.gap,
+        )
+
+    def body_forward(self) -> Vec3:
+        return self.cell.orientation.rotate(Vec3(1.0, 0.0, 0.0)).normalized()
+
+    def head_position(self) -> Vec3:
+        """Position mondiale de l'extrémité avant de la cellule."""
+        return self.cell.position + self.body_forward() * BODY_HALF_LENGTH
+
+    def contact_geometry(self) -> ContactGeometry:
+        """Calcule la direction et la marge entre la pointe et la sphère."""
+        contact_point = self.head_position()
+        contact_to_target = self.target - contact_point
+        surface_distance = contact_to_target.length()
+        return ContactGeometry(
+            point=contact_point,
+            direction=contact_to_target.normalized(),
+            surface_distance=surface_distance,
+            gap=surface_distance - TARGET_RADIUS,
+            center_distance=(self.target - self.cell.position).length(),
+            tip_distance=(self.target - self.head_position()).length(),
+        )
+
+    def distance_to_target(self) -> float:
+        """Espace signé entre la pointe blanche et la sphère cible."""
+        return self.contact_geometry().gap
+
+    def _curriculum_direction(self) -> Vec3:
+        if self.curriculum_level >= 2:
+            return random_unit_vector(self.rng)
+
+        # Le cône et l'hémisphère sont construits dans le repère de la cellule,
+        # puis orientés vers le monde. x local représente l'avant.
+        minimum_x = math.cos(math.radians(25.0)) if self.curriculum_level == 0 else 0.0
+        local_x = self.rng.uniform(minimum_x, 1.0)
+        radius = math.sqrt(max(0.0, 1.0 - local_x * local_x))
+        azimuth = self.rng.uniform(0.0, 2.0 * math.pi)
+        local = Vec3(local_x, radius * math.cos(azimuth), radius * math.sin(azimuth))
+        return self.cell.orientation.rotate(local).normalized()
+
+    def _inside_target_bounds(self, point: Vec3) -> bool:
+        limit = WORLD_HALF_SIZE - WORLD_MARGIN - CAPTURE_RADIUS
+        return all(abs(value) <= limit for value in (point.x, point.y, point.z))
+
+    def _sample_target(self) -> Vec3:
+        for _attempt in range(500):
+            distance = self.rng.uniform(MIN_TARGET_DISTANCE, MAX_TARGET_DISTANCE)
+            candidate = self.cell.position + self._curriculum_direction() * distance
+            if self._inside_target_bounds(candidate):
+                return candidate
+
+        # Près d'une paroi, le cône demandé peut ne contenir aucun point valide.
+        # Ce repli uniforme garantit toujours une cible atteignable.
+        limit = WORLD_HALF_SIZE - WORLD_MARGIN - CAPTURE_RADIUS
+        for _attempt in range(500):
+            candidate = Vec3(
+                self.rng.uniform(-limit, limit),
+                self.rng.uniform(-limit, limit),
+                self.rng.uniform(-limit, limit),
+            )
+            if (candidate - self.cell.position).length() >= MIN_TARGET_DISTANCE:
+                return candidate
+        return Vec3()
+
+    def set_curriculum_level(self, level: int) -> None:
+        self.curriculum_level = int(clamp(level, 0, 2))
+
+    def observations(self) -> list[float]:
+        # Le RN reçoit une direction unitaire depuis la pointe blanche et la
+        # marge séparant cette pointe de la sphère. La direction ne
+        # s'écrase donc plus vers zéro pendant la phase terminale.
+        contact = self.contact_geometry()
+        target_direction = self.cell.orientation.inverse_rotate(
+            contact.direction
+        )
+        local_velocity = self.cell.orientation.inverse_rotate(self.cell.velocity)
+        local_rotation = self.cell.orientation.inverse_rotate(
+            self.cell.angular_velocity
+        )
+        values = [
+            target_direction.x,
+            target_direction.y,
+            target_direction.z,
+            clamp(contact.gap / MAX_TARGET_DISTANCE, -1.0, 2.0),
+            clamp(
+                self.previous_radial_speed / MAX_CONTACT_SPEED,
+                -1.0,
+                1.0,
+            ),
+            local_velocity.x / MAX_CELL_SPEED,
+            local_velocity.y / MAX_CELL_SPEED,
+            local_velocity.z / MAX_CELL_SPEED,
+            local_rotation.x / MAX_CELL_ROTATION,
+            local_rotation.y / MAX_CELL_ROTATION,
+            local_rotation.z / MAX_CELL_ROTATION,
+        ]
+        for index, angles in enumerate(self.cell.joint_angles):
+            limit = JOINT_LIMITS[index]
+            values.extend((angles[0] / limit, angles[1] / limit))
+        for speeds in self.cell.joint_speeds:
+            values.extend(
+                (speeds[0] / MAX_JOINT_SPEED, speeds[1] / MAX_JOINT_SPEED)
+            )
+        values.extend(self.cell.motor_target_state)
+        if len(values) != OBSERVATION_SIZE:
+            raise RuntimeError("Dimension d'observation 3D incohérente.")
+        return values
+
+    def flagellum_geometry(self) -> FlagellumGeometry:
+        forward = self.body_forward()
+        attachment = self.cell.position - forward * BODY_HALF_LENGTH
+        points = [attachment]
+        middles: list[Vec3] = []
+        tangents: list[Vec3] = []
+        frame = self.cell.orientation
+
+        for segment_index, (yaw, pitch) in enumerate(self.cell.joint_angles):
+            yaw_rotation = Quaternion.from_axis_angle(Vec3(0.0, 0.0, 1.0), yaw)
+            pitch_rotation = Quaternion.from_axis_angle(Vec3(0.0, 1.0, 0.0), pitch)
+            frame = (frame * yaw_rotation * pitch_rotation).normalized()
+            tangent = frame.rotate(Vec3(-1.0, 0.0, 0.0)).normalized()
+            start = points[-1]
+            length = SEGMENT_LENGTHS[segment_index]
+            middles.append(start + tangent * (0.5 * length))
+            points.append(start + tangent * length)
+            tangents.append(tangent)
+        return FlagellumGeometry(points, middles, tangents)
+
+    @staticmethod
+    def segment_drag(
+        velocity: Vec3, tangent: Vec3, force_weight: float
+    ) -> Vec3:
+        """Force visqueuse anisotrope pondérée par la morphologie du segment."""
+        parallel = tangent * velocity.dot(tangent)
+        perpendicular_velocity = velocity - parallel
+        return (
+            parallel * (-DRAG_PARALLEL)
+            + perpendicular_velocity * (-DRAG_PERPENDICULAR)
+        ) * force_weight
+
+    def _apply_boundaries(self) -> tuple[bool, Vec3]:
+        hit = False
+        reaction = Vec3()
+        limit = WORLD_HALF_SIZE - WORLD_MARGIN - BODY_HALF_LENGTH
+        coordinates = ("x", "y", "z")
+        for name in coordinates:
+            value = getattr(self.cell.position, name)
+            velocity = getattr(self.cell.velocity, name)
+            if value < -limit:
+                setattr(self.cell.position, name, -limit)
+                setattr(self.cell.velocity, name, abs(velocity) * 0.15)
+                setattr(reaction, name, -limit - value + 0.5)
+                hit = True
+            elif value > limit:
+                setattr(self.cell.position, name, limit)
+                setattr(self.cell.velocity, name, -abs(velocity) * 0.15)
+                setattr(reaction, name, limit - value - 0.5)
+                hit = True
+        return hit, reaction
+
+    def _advance_target(self) -> None:
+        self.target = self._sample_target()
+        self.previous_distance = self.distance_to_target()
+        self.previous_radial_speed = 0.0
+        self.initial_distance = max(self.previous_distance, 1.0)
+        self.episode_step = 0
+        self.episode_reward = 0.0
+        self.episode_path_length = 0.0
+        self.episode_energy = 0.0
+        self.episode_wall_hits = 0
+        self.episode_lateral_motion = 0.0
+
+    def step(self, action: list[float], remember_trajectory: bool) -> StepOutcome:
+        if len(action) != ACTION_SIZE:
+            raise ValueError("Une action 3D doit contenir six commandes.")
+
+        # Positions avant l'action. La pointe reste diagnostiquée, mais la
+        # progression fonctionnelle suit le point réel de contact.
+        old_center_position = Vec3(
+            self.cell.position.x,
+            self.cell.position.y,
+            self.cell.position.z,
+        )
+        old_head_position = self.head_position()
+        old_contact = self.contact_geometry()
+
+        # État d'orientation avant l'action. La différence avec l'alignement
+        # final permet de récompenser une rotation apprise par l'Actor, sans
+        # ajouter de réflexe ni de force dirigée automatiquement vers la cible.
+        target_direction_before = old_contact.direction
+        alignment_before = self.body_forward().dot(target_direction_before)
+
+        bounded_action = [clamp(float(value), -1.0, 1.0) for value in action]
+        # Chaque sortie est un angle articulaire cible normalisé. Le filtre
+        # protège le servo des sauts instantanés, mais ne crée ni rythme ni onde.
+        applied_action: list[float] = []
+        for index, requested_value in enumerate(bounded_action):
+            filtered_value = (
+                DIRECT_TARGET_RETENTION * self.cell.motor_target_state[index]
+                + (1.0 - DIRECT_TARGET_RETENTION) * requested_value
+            )
+            applied_action.append(clamp(filtered_value, -1.0, 1.0))
+        self.cell.motor_target_state = applied_action
+        old_geometry = self.flagellum_geometry()
+
+        for segment_index in range(SEGMENT_COUNT):
+            limit = JOINT_LIMITS[segment_index]
+            for axis_index in range(2):
+                action_index = 2 * segment_index + axis_index
+                previous_angle = self.cell.joint_angles[segment_index][axis_index]
+                target_angle = limit * applied_action[action_index]
+                commanded_speed = (
+                    self.cell.joint_speeds[segment_index][axis_index]
+                    * JOINT_DAMPING
+                    + JOINT_SERVO_GAIN * (target_angle - previous_angle)
+                )
+                commanded_speed = clamp(
+                    commanded_speed, -MAX_JOINT_SPEED, MAX_JOINT_SPEED
+                )
+                angle = clamp(
+                    previous_angle + commanded_speed, -limit, limit
+                )
+
+                # La vitesse mémorisée est le déplacement réellement effectué.
+                # À une butée, une commande dirigée vers l'extérieur donne donc
+                # une vitesse nulle au lieu d'une vitesse fictive.
+                actual_speed = angle - previous_angle
+                self.cell.joint_speeds[segment_index][axis_index] = actual_speed
+                self.cell.joint_angles[segment_index][axis_index] = angle
+
+        geometry = self.flagellum_geometry()
+        segment_forces: list[Vec3] = []
+        for old_middle, new_middle, tangent, force_weight in zip(
+            old_geometry.middles,
+            geometry.middles,
+            geometry.tangents,
+            SEGMENT_FORCE_WEIGHTS,
+        ):
+            deformation_velocity = new_middle - old_middle
+            segment_forces.append(
+                self.segment_drag(deformation_velocity, tangent, force_weight)
+            )
+
+        # Aire orientée parcourue par deux articulations successives. Le RN doit
+        # découvrir lui-même une boucle non réciproque pour créer cette aire.
+        cyclic_rate = 0.0
+        for index in range(SEGMENT_COUNT - 1):
+            angle_a = self.cell.joint_angles[index]
+            angle_b = self.cell.joint_angles[index + 1]
+            speed_a = self.cell.joint_speeds[index]
+            speed_b = self.cell.joint_speeds[index + 1]
+            cyclic_rate += angle_a[0] * speed_b[0] - angle_b[0] * speed_a[0]
+            cyclic_rate += angle_a[1] * speed_b[1] - angle_b[1] * speed_a[1]
+
+        forward_cyclic_rate = abs(cyclic_rate)
+        shape_force = self.body_forward() * (
+            SHAPE_PROPULSION * forward_cyclic_rate
+        )
+        total_force_weight = sum(SEGMENT_FORCE_WEIGHTS)
+        for index in range(SEGMENT_COUNT):
+            # La poussée de forme est répartie selon la même morphologie que la
+            # version CPG afin de rendre les performances comparables.
+            shape_share = SEGMENT_FORCE_WEIGHTS[index] / total_force_weight
+            segment_forces[index] = segment_forces[index] + shape_force * shape_share
+
+        total_force = Vec3()
+        torque = Vec3()
+        for middle, force in zip(geometry.middles, segment_forces):
+            total_force = total_force + force
+            torque = torque + (middle - self.cell.position).cross(force)
+
+        desired_velocity = (total_force * FORCE_TO_SPEED).limited(MAX_CELL_SPEED)
+        self.cell.velocity = (
+            self.cell.velocity * LINEAR_DAMPING
+            + desired_velocity * (1.0 - LINEAR_DAMPING)
+        ).limited(MAX_CELL_SPEED)
+        desired_rotation = (torque * TORQUE_TO_ROTATION).limited(MAX_CELL_ROTATION)
+        self.cell.angular_velocity = (
+            self.cell.angular_velocity * ANGULAR_DAMPING
+            + desired_rotation * (1.0 - ANGULAR_DAMPING)
+        ).limited(MAX_CELL_ROTATION)
+
+        rotation_increment = Quaternion.from_rotation_vector(
+            self.cell.angular_velocity
+        )
+        self.cell.orientation = (
+            rotation_increment * self.cell.orientation
+        ).normalized()
+
+        self.cell.position = self.cell.position + self.cell.velocity
+        wall_hit, wall_reaction = self._apply_boundaries()
+        # Le trajet mesure la translation du corps. Une simple rotation de la
+        # tête ne doit plus améliorer artificiellement l'efficacité du chemin.
+        head_position = self.head_position()
+        head_velocity = head_position - old_head_position
+        center_displacement = self.cell.position - old_center_position
+        displacement = center_displacement.length()
+
+        self.episode_path_length += displacement
+        # L'énergie dépend uniquement des six mouvements réellement exécutés.
+        energy = sum(
+            (speed / MAX_JOINT_SPEED) ** 2
+            for pair in self.cell.joint_speeds
+            for speed in pair
+        ) / ACTION_SIZE
+        self.episode_energy += energy
+        self.episode_step += 1
+        self.total_steps += 1
+        if wall_hit:
+            self.episode_wall_hits += 1
+
+        contact = self.contact_geometry()
+        contact_velocity = contact.point - old_contact.point
+        target_direction = contact.direction
+        useful_speed = contact_velocity.dot(target_direction)
+        lateral_vector = contact_velocity - target_direction * useful_speed
+        lateral_speed = lateral_vector.length()
+        self.episode_lateral_motion += lateral_speed
+        alignment = self.body_forward().dot(target_direction)
+        alignment_progress = alignment - alignment_before
+        # Le plus grand des deux poids empêche un aller-retour artificiel :
+        # quitter le bon alignement est pénalisé avec la même logique que le
+        # retour vers celui-ci est récompensé.
+        rotation_reward_gate = max(
+            turning_reward_gate(alignment_before),
+            turning_reward_gate(alignment),
+        )
+        contact_progress = self.previous_distance - contact.gap
+        center_progress = old_contact.center_distance - contact.center_distance
+        tip_progress = old_contact.tip_distance - contact.tip_distance
+        normalized_progress = contact_progress / max(self.initial_distance, 1.0)
+
+        # La proximité vaut 0 loin de la cible et 1 sur le rayon de capture.
+        # On retire progressivement le bonus d'alignement pendant l'accostage :
+        # pointer le corps ne doit pas devenir plus rentable qu'entrer.
+        terminal_proximity = clamp(
+            1.0 - contact.gap / TERMINAL_GUIDANCE_GAP,
+            0.0,
+            1.0,
+        )
+        alignment_distance_factor = (
+            TERMINAL_ALIGNMENT_MIN_FACTOR
+            + (1.0 - TERMINAL_ALIGNMENT_MIN_FACTOR)
+            * (1.0 - terminal_proximity)
+        )
+
+        contact_speed = contact_velocity.length()
+        tangential_fraction = (
+            clamp(lateral_speed / contact_speed, 0.0, 1.0)
+            if contact_speed > ORBIT_MIN_HEAD_SPEED
+            else 0.0
+        )
+
+        near_miss = (
+            self.previous_radial_speed > NEAR_MISS_MIN_APPROACH_SPEED
+            and useful_speed <= 0.0
+            and 0.0 < contact.gap <= NEAR_MISS_MAX_GAP
+        )
+        near_miss_proximity = clamp(
+            1.0 - contact.gap / NEAR_MISS_MAX_GAP,
+            0.0,
+            1.0,
+        )
+        outward_speed_ratio = clamp(
+            max(0.0, -useful_speed) / MAX_CONTACT_SPEED,
+            0.0,
+            1.0,
+        )
+        time_to_contact, anticipation_risk = contact_anticipation(
+            contact.gap,
+            useful_speed,
+        )
+
+        reward_progress = PROGRESS_REWARD * normalized_progress
+        reward_alignment = (
+            ALIGNMENT_PROGRESS_REWARD
+            * alignment_progress
+            * rotation_reward_gate
+            * alignment_distance_factor
+        )
+        reward_time = -TIME_PENALTY
+        reward_energy = -ENERGY_PENALTY * energy
+        reward_orbit = (
+            -ORBIT_PENALTY
+            * terminal_proximity
+            * tangential_fraction**2
+        )
+        reward_anticipation = (
+            -ANTICIPATION_PENALTY * anticipation_risk**2
+        )
+        reward_near_miss = -NEAR_MISS_PENALTY if near_miss else 0.0
+        reward_overshoot = (
+            -OVERSHOOT_PENALTY
+            * near_miss_proximity
+            * outward_speed_ratio
+        )
+        reward_stagnation = 0.0
+        reward_wall = 0.0
+        reward_capture = 0.0
+
+        reward = (
+            reward_progress
+            + reward_alignment
+            + reward_time
+            + reward_energy
+            + reward_orbit
+            + reward_anticipation
+            + reward_near_miss
+            + reward_overshoot
+        )
+        if (
+            self.episode_step >= STAGNATION_GRACE_STEPS
+            and contact.gap > 0.0
+            and self.cell.velocity.length() < STAGNATION_SPEED
+            and self.cell.angular_velocity.length() < STAGNATION_ROTATION
+        ):
+            reward_stagnation = -STAGNATION_PENALTY
+            reward += reward_stagnation
+        if wall_hit:
+            reward_wall = -WALL_PENALTY
+            reward += reward_wall
+
+        # Contact physique : distance entre les deux surfaces nulle ou négative.
+        captured = contact.gap <= 0.0
+        timeout_limit = int(TIMEOUT_BASE + TIMEOUT_PER_UNIT * self.initial_distance)
+        timed_out = self.episode_step >= timeout_limit
+        if captured:
+            reward_capture = CAPTURE_REWARD
+            reward += reward_capture
+            self.total_captures += 1
+        elif timed_out:
+            self.total_timeouts += 1
+
+        self.episode_reward += reward
+        self.previous_distance = contact.gap
+        self.previous_radial_speed = useful_speed
+        terminal = captured or timed_out
+        metrics: EpisodeMetrics | None = None
+        if terminal:
+            effective_speed = (
+                self.initial_distance / max(self.episode_step, 1)
+                if captured
+                else 0.0
+            )
+            path_efficiency = (
+                min(1.0, self.initial_distance / max(self.episode_path_length, 1e-9))
+                if captured
+                else 0.0
+            )
+            metrics = EpisodeMetrics(
+                reward=self.episode_reward,
+                captured=captured,
+                steps=self.episode_step,
+                initial_distance=self.initial_distance,
+                normalized_time=self.episode_step / max(self.initial_distance, 1.0),
+                effective_speed=effective_speed,
+                path_efficiency=path_efficiency,
+                energy=self.episode_energy,
+                wall_hits=self.episode_wall_hits,
+                lateral_motion=self.episode_lateral_motion,
+            )
+            self._advance_target()
+
+        if remember_trajectory:
+            self.trajectory.append(
+                Vec3(self.cell.position.x, self.cell.position.y, self.cell.position.z)
+            )
+            if len(self.trajectory) > 700:
+                del self.trajectory[:120]
+
+        # Une capture installe immédiatement une nouvelle cible. L'IHM montre
+        # sa géométrie, mais conserve les composantes de récompense du pas fini.
+        telemetry_contact = self.contact_geometry()
+        if terminal:
+            telemetry_contact_velocity = Vec3()
+            telemetry_useful_speed = 0.0
+            telemetry_lateral_speed = 0.0
+        else:
+            telemetry_contact_velocity = contact_velocity
+            telemetry_useful_speed = useful_speed
+            telemetry_lateral_speed = lateral_speed
+        telemetry_alignment = self.body_forward().dot(
+            telemetry_contact.direction
+        )
+
+        self.telemetry = Telemetry(
+            segment_forces=segment_forces,
+            propulsion=total_force * FORCE_TO_SPEED,
+            velocity=self.cell.velocity,
+            head_velocity=head_velocity,
+            contact_velocity=telemetry_contact_velocity,
+            contact_point=telemetry_contact.point,
+            target_direction=telemetry_contact.direction,
+            wall_reaction=wall_reaction,
+            torque=torque,
+            reward=reward,
+            reward_progress=reward_progress,
+            reward_alignment=reward_alignment,
+            reward_time=reward_time,
+            reward_energy=reward_energy,
+            reward_orbit=reward_orbit,
+            reward_anticipation=reward_anticipation,
+            reward_near_miss=reward_near_miss,
+            reward_overshoot=reward_overshoot,
+            reward_stagnation=reward_stagnation,
+            reward_wall=reward_wall,
+            reward_capture=reward_capture,
+            distance_to_target=telemetry_contact.surface_distance,
+            center_distance=telemetry_contact.center_distance,
+            tip_distance=telemetry_contact.tip_distance,
+            contact_gap=telemetry_contact.gap,
+            radial_speed=telemetry_useful_speed,
+            time_to_contact=time_to_contact if not terminal else 999.9,
+            anticipation_risk=anticipation_risk if not terminal else 0.0,
+            center_progress=center_progress,
+            tip_progress=tip_progress,
+            contact_progress=contact_progress,
+            useful_speed=telemetry_useful_speed,
+            lateral_speed=telemetry_lateral_speed,
+            alignment=telemetry_alignment,
+            bearing_degrees=math.degrees(
+                math.acos(clamp(telemetry_alignment, -1.0, 1.0))
+            ),
+            tangential_fraction=tangential_fraction,
+            terminal_proximity=terminal_proximity,
+            alignment_distance_factor=alignment_distance_factor,
+            target_behind=(
+                self.cell.orientation.inverse_rotate(
+                    self.target - telemetry_contact.point
+                ).x < 0.0
+            ),
+            near_miss=near_miss,
+            requested_action=bounded_action,
+            action=applied_action,
+            captured=captured,
+            timed_out=timed_out and not captured,
+        )
+        return StepOutcome(reward, terminal, metrics)
+
+    def to_dict(self) -> dict[str, Any]:
+        def vector(value: Vec3) -> list[float]:
+            return [value.x, value.y, value.z]
+
+        return {
+            "seed": self.seed,
+            "rng_state": repr(self.rng.getstate()),
+            "curriculum_level": self.curriculum_level,
+            "target": vector(self.target),
+            "cell": {
+                "position": vector(self.cell.position),
+                "orientation": asdict(self.cell.orientation),
+                "velocity": vector(self.cell.velocity),
+                "angular_velocity": vector(self.cell.angular_velocity),
+                "joint_angles": self.cell.joint_angles,
+                "joint_speeds": self.cell.joint_speeds,
+                "motor_target_state": self.cell.motor_target_state,
+            },
+            "previous_distance": self.previous_distance,
+            "previous_radial_speed": self.previous_radial_speed,
+            "initial_distance": self.initial_distance,
+            "episode_step": self.episode_step,
+            "episode_reward": self.episode_reward,
+            "episode_path_length": self.episode_path_length,
+            "episode_energy": self.episode_energy,
+            "episode_wall_hits": self.episode_wall_hits,
+            "episode_lateral_motion": self.episode_lateral_motion,
+            "total_steps": self.total_steps,
+            "total_captures": self.total_captures,
+            "total_timeouts": self.total_timeouts,
+            "trajectory": [vector(item) for item in self.trajectory],
+            "telemetry": {
+                "segment_forces": [vector(item) for item in self.telemetry.segment_forces],
+                "propulsion": vector(self.telemetry.propulsion),
+                "velocity": vector(self.telemetry.velocity),
+                "head_velocity": vector(self.telemetry.head_velocity),
+                "contact_velocity": vector(self.telemetry.contact_velocity),
+                "contact_point": vector(self.telemetry.contact_point),
+                "target_direction": vector(self.telemetry.target_direction),
+                "wall_reaction": vector(self.telemetry.wall_reaction),
+                "torque": vector(self.telemetry.torque),
+                "reward": self.telemetry.reward,
+                "reward_progress": self.telemetry.reward_progress,
+                "reward_alignment": self.telemetry.reward_alignment,
+                "reward_time": self.telemetry.reward_time,
+                "reward_energy": self.telemetry.reward_energy,
+                "reward_orbit": self.telemetry.reward_orbit,
+                "reward_anticipation": self.telemetry.reward_anticipation,
+                "reward_near_miss": self.telemetry.reward_near_miss,
+                "reward_overshoot": self.telemetry.reward_overshoot,
+                "reward_stagnation": self.telemetry.reward_stagnation,
+                "reward_wall": self.telemetry.reward_wall,
+                "reward_capture": self.telemetry.reward_capture,
+                "distance_to_target": self.telemetry.distance_to_target,
+                "center_distance": self.telemetry.center_distance,
+                "tip_distance": self.telemetry.tip_distance,
+                "contact_gap": self.telemetry.contact_gap,
+                "radial_speed": self.telemetry.radial_speed,
+                "time_to_contact": self.telemetry.time_to_contact,
+                "anticipation_risk": self.telemetry.anticipation_risk,
+                "center_progress": self.telemetry.center_progress,
+                "tip_progress": self.telemetry.tip_progress,
+                "contact_progress": self.telemetry.contact_progress,
+                "useful_speed": self.telemetry.useful_speed,
+                "lateral_speed": self.telemetry.lateral_speed,
+                "alignment": self.telemetry.alignment,
+                "bearing_degrees": self.telemetry.bearing_degrees,
+                "tangential_fraction": self.telemetry.tangential_fraction,
+                "terminal_proximity": self.telemetry.terminal_proximity,
+                "alignment_distance_factor": self.telemetry.alignment_distance_factor,
+                "target_behind": self.telemetry.target_behind,
+                "near_miss": self.telemetry.near_miss,
+                "requested_action": self.telemetry.requested_action,
+                "action": self.telemetry.action,
+                "captured": self.telemetry.captured,
+                "timed_out": self.telemetry.timed_out,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CellWorld3D":
+        def vector(values: Any) -> Vec3:
+            if not isinstance(values, list) or len(values) != 3:
+                raise ValueError("Vecteur 3D invalide dans la sauvegarde.")
+            return Vec3(float(values[0]), float(values[1]), float(values[2]))
+
+        world = cls(int(data["seed"]), int(data["curriculum_level"]))
+        world.rng.setstate(ast.literal_eval(str(data["rng_state"])))
+        world.target = vector(data["target"])
+        cell = data["cell"]
+        orientation = cell["orientation"]
+        world.cell = CellState(
+            position=vector(cell["position"]),
+            orientation=Quaternion(
+                float(orientation["w"]),
+                float(orientation["x"]),
+                float(orientation["y"]),
+                float(orientation["z"]),
+            ).normalized(),
+            velocity=vector(cell["velocity"]),
+            angular_velocity=vector(cell["angular_velocity"]),
+            joint_angles=[[float(v) for v in pair] for pair in cell["joint_angles"]],
+            joint_speeds=[[float(v) for v in pair] for pair in cell["joint_speeds"]],
+            motor_target_state=[
+                float(value)
+                for value in cell["motor_target_state"]
+            ],
+        )
+        for name in (
+            "previous_distance",
+            "initial_distance",
+            "episode_reward",
+            "episode_path_length",
+            "episode_energy",
+            "episode_lateral_motion",
+        ):
+            setattr(world, name, float(data[name]))
+        world.previous_radial_speed = float(data["previous_radial_speed"])
+        for name in (
+            "episode_step",
+            "episode_wall_hits",
+            "total_steps",
+            "total_captures",
+            "total_timeouts",
+        ):
+            setattr(world, name, int(data[name]))
+        world.trajectory = [vector(item) for item in data["trajectory"]]
+        telemetry = data["telemetry"]
+        world.telemetry = Telemetry(
+            segment_forces=[vector(item) for item in telemetry["segment_forces"]],
+            propulsion=vector(telemetry["propulsion"]),
+            velocity=vector(telemetry["velocity"]),
+            head_velocity=vector(
+                telemetry.get("head_velocity", telemetry["velocity"])
+            ),
+            contact_velocity=vector(telemetry["contact_velocity"]),
+            contact_point=vector(telemetry["contact_point"]),
+            target_direction=vector(telemetry["target_direction"]),
+            wall_reaction=vector(telemetry["wall_reaction"]),
+            torque=vector(telemetry["torque"]),
+            reward=float(telemetry["reward"]),
+            reward_progress=float(telemetry.get("reward_progress", 0.0)),
+            reward_alignment=float(telemetry.get("reward_alignment", 0.0)),
+            reward_time=float(telemetry.get("reward_time", 0.0)),
+            reward_energy=float(telemetry.get("reward_energy", 0.0)),
+            reward_orbit=float(telemetry.get("reward_orbit", 0.0)),
+            reward_anticipation=float(
+                telemetry.get("reward_anticipation", 0.0)
+            ),
+            reward_near_miss=float(telemetry.get("reward_near_miss", 0.0)),
+            reward_overshoot=float(telemetry.get("reward_overshoot", 0.0)),
+            reward_stagnation=float(telemetry.get("reward_stagnation", 0.0)),
+            reward_wall=float(telemetry.get("reward_wall", 0.0)),
+            reward_capture=float(telemetry.get("reward_capture", 0.0)),
+            distance_to_target=float(telemetry["distance_to_target"]),
+            center_distance=float(telemetry["center_distance"]),
+            tip_distance=float(telemetry["tip_distance"]),
+            contact_gap=float(telemetry["contact_gap"]),
+            radial_speed=float(telemetry["radial_speed"]),
+            time_to_contact=float(telemetry.get("time_to_contact", 999.9)),
+            anticipation_risk=float(telemetry.get("anticipation_risk", 0.0)),
+            center_progress=float(telemetry["center_progress"]),
+            tip_progress=float(telemetry["tip_progress"]),
+            contact_progress=float(telemetry["contact_progress"]),
+            useful_speed=float(telemetry["useful_speed"]),
+            lateral_speed=float(telemetry["lateral_speed"]),
+            alignment=float(telemetry["alignment"]),
+            bearing_degrees=float(telemetry.get("bearing_degrees", 0.0)),
+            tangential_fraction=float(telemetry.get("tangential_fraction", 0.0)),
+            terminal_proximity=float(telemetry.get("terminal_proximity", 0.0)),
+            alignment_distance_factor=float(
+                telemetry.get("alignment_distance_factor", 1.0)
+            ),
+            target_behind=bool(telemetry.get("target_behind", False)),
+            near_miss=bool(telemetry.get("near_miss", False)),
+            requested_action=[
+                float(value)
+                for value in telemetry.get("requested_action", telemetry["action"])
+            ],
+            action=[float(value) for value in telemetry["action"]],
+            captured=bool(telemetry["captured"]),
+            timed_out=bool(telemetry["timed_out"]),
+        )
+        if len(world.cell.joint_angles) != SEGMENT_COUNT:
+            raise ValueError("Nombre d'articulations incompatible.")
+        if len(world.cell.motor_target_state) != ACTION_SIZE:
+            raise ValueError("État des cibles articulaires incompatible.")
+        return world
+
+
+# ---------------------------------------------------------------------------
+# Réseau Actor-Critic continu et PPO
+# ---------------------------------------------------------------------------
+
+
+if TORCH_AVAILABLE:
+
+    class ContinuousActorCritic(nn.Module):  # type: ignore[misc]
+        """Tronc partagé 29 -> 128 -> 128, Actor gaussien et Critic V(s)."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.shared = nn.Sequential(
+                nn.Linear(OBSERVATION_SIZE, HIDDEN_SIZE),
+                nn.Tanh(),
+                nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE),
+                nn.Tanh(),
+            )
+            self.actor_mean = nn.Linear(HIDDEN_SIZE, ACTION_SIZE)
+            self.actor_log_std = nn.Parameter(torch.full((ACTION_SIZE,), -0.45))
+            self.critic = nn.Linear(HIDDEN_SIZE, 1)
+            self._initialize()
+
+        def _initialize(self) -> None:
+            for layer in self.shared:
+                if isinstance(layer, nn.Linear):
+                    nn.init.orthogonal_(layer.weight, gain=math.sqrt(2.0))
+                    nn.init.zeros_(layer.bias)
+            nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+            nn.init.zeros_(self.actor_mean.bias)
+            nn.init.orthogonal_(self.critic.weight, gain=1.0)
+            nn.init.zeros_(self.critic.bias)
+
+        def forward(self, observations: Any) -> tuple[Any, Any, Any]:
+            hidden = self.shared(observations)
+            mean = self.actor_mean(hidden)
+            log_std = self.actor_log_std.clamp(-3.0, 1.0).expand_as(mean)
+            value = self.critic(hidden).squeeze(-1)
+            return mean, log_std, value
+
+else:
+
+    class ContinuousActorCritic:  # type: ignore[no-redef]
+        def __init__(self) -> None:
+            raise RuntimeError("PyTorch est requis : py -m pip install torch")
+
+
+@dataclass
+class PPOHistory:
+    rewards: list[float] = field(default_factory=list)
+    successes: list[float] = field(default_factory=list)
+    path_efficiencies: list[float] = field(default_factory=list)
+    effective_speeds: list[float] = field(default_factory=list)
+    lateral_motions: list[float] = field(default_factory=list)
+    policy_losses: list[float] = field(default_factory=list)
+    value_losses: list[float] = field(default_factory=list)
+    entropies: list[float] = field(default_factory=list)
+    approximate_kls: list[float] = field(default_factory=list)
+    clip_fractions: list[float] = field(default_factory=list)
+
+
+@dataclass
+class PPOUpdateMetrics:
+    policy_loss: float = 0.0
+    value_loss: float = 0.0
+    entropy: float = 0.0
+    approximate_kl: float = 0.0
+    clip_fraction: float = 0.0
+    gradient_norm: float = 0.0
+    entropy_coefficient: float = ENTROPY_START
+
+
+class PPOTrainer3D:
+    def __init__(self, seed: int = 1234, device_name: str = "cpu") -> None:
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch n'est pas installé.")
+        self.seed = seed
+        self.device_name = device_name
+        self.device = torch.device(device_name)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        self.model = ContinuousActorCritic().to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
+        self.action_generator = torch.Generator(device=self.device)
+        self.action_generator.manual_seed(seed + 100)
+        self.shuffle_generator = torch.Generator(device="cpu")
+        self.shuffle_generator.manual_seed(seed + 200)
+        self.worlds = [
+            CellWorld3D(seed + 1000 + index * 37, curriculum_level=0)
+            for index in range(ENVIRONMENT_COUNT)
+        ]
+        self.history = PPOHistory()
+        self.updates = 0
+        self.total_environment_steps = 0
+        self.episodes = 0
+        self.captures = 0
+        self.last_episode: EpisodeMetrics | None = None
+        self.last_update = PPOUpdateMetrics()
+
+    def curriculum_level(self) -> int:
+        if self.updates < 250:
+            return 0
+        if self.updates < 800:
+            return 1
+        return 2
+
+    def entropy_coefficient(self) -> float:
+        fraction = min(1.0, self.updates / max(1, ENTROPY_DECAY_UPDATES))
+        return ENTROPY_START + fraction * (ENTROPY_END - ENTROPY_START)
+
+    def observations_tensor(self) -> Any:
+        return torch.tensor(
+            [world.observations() for world in self.worlds],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    @staticmethod
+    def distribution(mean: Any, log_std: Any) -> Any:
+        return Normal(mean, log_std.exp())
+
+    @staticmethod
+    def sample_raw_action(mean: Any, log_std: Any, generator: Any) -> Any:
+        noise = torch.randn(
+            mean.shape,
+            dtype=mean.dtype,
+            device=mean.device,
+            generator=generator,
+        )
+        return mean + log_std.exp() * noise
+
+    def infer(
+        self, observations: list[float], generator: Any, deterministic: bool
+    ) -> list[float]:
+        self.model.eval()
+        with torch.no_grad():
+            tensor = torch.tensor(
+                [observations], dtype=torch.float32, device=self.device
+            )
+            mean, log_std, _value = self.model(tensor)
+            raw = mean if deterministic else self.sample_raw_action(
+                mean, log_std, generator
+            )
+            action = torch.tanh(raw)
+        return [float(value) for value in action[0].tolist()]
+
+    def _record_episode(self, metrics: EpisodeMetrics) -> None:
+        self.episodes += 1
+        if metrics.captured:
+            self.captures += 1
+        self.last_episode = metrics
+        self.history.rewards.append(metrics.reward)
+        self.history.successes.append(1.0 if metrics.captured else 0.0)
+        self.history.path_efficiencies.append(metrics.path_efficiency)
+        self.history.effective_speeds.append(metrics.effective_speed)
+        self.history.lateral_motions.append(metrics.lateral_motion)
+
+    def success_rate(self, window: int = 20) -> float:
+        values = self.history.successes[-window:]
+        return sum(values) / len(values) if values else 0.0
+
+    def ppo_update(self) -> PPOUpdateMetrics:
+        self.model.train()
+        level = self.curriculum_level()
+        for world in self.worlds:
+            world.set_curriculum_level(level)
+
+        observations: list[Any] = []
+        raw_actions: list[Any] = []
+        old_log_probabilities: list[Any] = []
+        rewards: list[Any] = []
+        dones: list[Any] = []
+        values: list[Any] = []
+
+        current_observations = self.observations_tensor()
+        for _step in range(ROLLOUT_STEPS):
+            with torch.no_grad():
+                mean, log_std, value = self.model(current_observations)
+                raw_action = self.sample_raw_action(
+                    mean, log_std, self.action_generator
+                )
+                distribution = self.distribution(mean, log_std)
+                log_probability = distribution.log_prob(raw_action).sum(dim=-1)
+                bounded_action = torch.tanh(raw_action)
+
+            step_rewards: list[float] = []
+            step_dones: list[float] = []
+            for world, action in zip(self.worlds, bounded_action.tolist()):
+                outcome = world.step(action, remember_trajectory=False)
+                step_rewards.append(outcome.reward)
+                step_dones.append(1.0 if outcome.terminal else 0.0)
+                if outcome.metrics is not None:
+                    self._record_episode(outcome.metrics)
+
+            observations.append(current_observations)
+            raw_actions.append(raw_action)
+            old_log_probabilities.append(log_probability)
+            values.append(value)
+            rewards.append(
+                torch.tensor(step_rewards, dtype=torch.float32, device=self.device)
+            )
+            dones.append(
+                torch.tensor(step_dones, dtype=torch.float32, device=self.device)
+            )
+            current_observations = self.observations_tensor()
+
+        with torch.no_grad():
+            _mean, _log_std, next_value = self.model(current_observations)
+
+        observation_tensor = torch.stack(observations)
+        raw_action_tensor = torch.stack(raw_actions)
+        old_log_probability_tensor = torch.stack(old_log_probabilities)
+        reward_tensor = torch.stack(rewards)
+        done_tensor = torch.stack(dones)
+        value_tensor = torch.stack(values)
+
+        advantages = torch.zeros_like(reward_tensor)
+        gae = torch.zeros(ENVIRONMENT_COUNT, device=self.device)
+        bootstrap = next_value
+        for step_index in reversed(range(ROLLOUT_STEPS)):
+            not_terminal = 1.0 - done_tensor[step_index]
+            delta = (
+                reward_tensor[step_index]
+                + GAMMA * bootstrap * not_terminal
+                - value_tensor[step_index]
+            )
+            gae = delta + GAMMA * GAE_LAMBDA * not_terminal * gae
+            advantages[step_index] = gae
+            bootstrap = value_tensor[step_index]
+        returns = advantages + value_tensor
+
+        batch_observations = observation_tensor.reshape(-1, OBSERVATION_SIZE)
+        batch_raw_actions = raw_action_tensor.reshape(-1, ACTION_SIZE)
+        batch_old_log_probabilities = old_log_probability_tensor.reshape(-1)
+        batch_old_values = value_tensor.reshape(-1)
+        batch_returns = returns.reshape(-1)
+        batch_advantages = advantages.reshape(-1)
+        batch_advantages = (
+            batch_advantages - batch_advantages.mean()
+        ) / (batch_advantages.std(unbiased=False) + 1e-8)
+
+        batch_size = batch_observations.shape[0]
+        entropy_coefficient = self.entropy_coefficient()
+        sums = {key: 0.0 for key in ("policy", "value", "entropy", "kl", "clip", "gradient")}
+        minibatch_count = 0
+        stop_early = False
+
+        for _epoch in range(PPO_EPOCHS):
+            permutation = torch.randperm(
+                batch_size, generator=self.shuffle_generator
+            ).to(self.device)
+            for start in range(0, batch_size, MINIBATCH_SIZE):
+                indices = permutation[start : start + MINIBATCH_SIZE]
+                mean, log_std, new_values = self.model(batch_observations[indices])
+                distribution = self.distribution(mean, log_std)
+                new_log_probabilities = distribution.log_prob(
+                    batch_raw_actions[indices]
+                ).sum(dim=-1)
+                entropy = distribution.entropy().sum(dim=-1).mean()
+                log_ratio = new_log_probabilities - batch_old_log_probabilities[indices]
+                ratio = log_ratio.exp()
+                advantage_slice = batch_advantages[indices]
+                unclipped = -advantage_slice * ratio
+                clipped = -advantage_slice * torch.clamp(
+                    ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP
+                )
+                policy_loss = torch.maximum(unclipped, clipped).mean()
+
+                old_values = batch_old_values[indices]
+                clipped_values = old_values + torch.clamp(
+                    new_values - old_values, -VALUE_CLIP, VALUE_CLIP
+                )
+                value_loss = 0.5 * torch.maximum(
+                    (new_values - batch_returns[indices]).pow(2),
+                    (clipped_values - batch_returns[indices]).pow(2),
+                ).mean()
+                loss = (
+                    policy_loss
+                    + VALUE_COEFFICIENT * value_loss
+                    - entropy_coefficient * entropy
+                )
+
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), MAX_GRADIENT_NORM
+                )
+                self.optimizer.step()
+
+                with torch.no_grad():
+                    approximate_kl = ((ratio - 1.0) - log_ratio).mean()
+                    clip_fraction = (
+                        (torch.abs(ratio - 1.0) > PPO_CLIP).float().mean()
+                    )
+                sums["policy"] += float(policy_loss.item())
+                sums["value"] += float(value_loss.item())
+                sums["entropy"] += float(entropy.item())
+                sums["kl"] += float(approximate_kl.item())
+                sums["clip"] += float(clip_fraction.item())
+                sums["gradient"] += float(gradient_norm.item())
+                minibatch_count += 1
+                if float(approximate_kl.item()) > TARGET_KL:
+                    stop_early = True
+                    break
+            if stop_early:
+                break
+
+        divisor = max(1, minibatch_count)
+        result = PPOUpdateMetrics(
+            policy_loss=sums["policy"] / divisor,
+            value_loss=sums["value"] / divisor,
+            entropy=sums["entropy"] / divisor,
+            approximate_kl=sums["kl"] / divisor,
+            clip_fraction=sums["clip"] / divisor,
+            gradient_norm=sums["gradient"] / divisor,
+            entropy_coefficient=entropy_coefficient,
+        )
+        self.last_update = result
+        self.updates += 1
+        self.total_environment_steps += ROLLOUT_STEPS * ENVIRONMENT_COUNT
+        self.history.policy_losses.append(result.policy_loss)
+        self.history.value_losses.append(result.value_loss)
+        self.history.entropies.append(result.entropy)
+        self.history.approximate_kls.append(result.approximate_kl)
+        self.history.clip_fractions.append(result.clip_fraction)
+        return result
+
+    def checkpoint(self) -> dict[str, Any]:
+        return {
+            "format": SESSION_FORMAT,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "action_generator_state": self.action_generator.get_state(),
+            "shuffle_generator_state": self.shuffle_generator.get_state(),
+            "seed": self.seed,
+            "device_name": self.device_name,
+            "worlds": [world.to_dict() for world in self.worlds],
+            "history": asdict(self.history),
+            "updates": self.updates,
+            "total_environment_steps": self.total_environment_steps,
+            "episodes": self.episodes,
+            "captures": self.captures,
+            "last_episode": asdict(self.last_episode) if self.last_episode else None,
+            "last_update": asdict(self.last_update),
+        }
+
+    def restore_checkpoint(self, data: dict[str, Any]) -> None:
+        if data.get("format") != SESSION_FORMAT:
+            raise ValueError(
+                "Cette sauvegarde utilise une ancienne observation ou une ancienne "
+                "architecture motrice. La version Full RN doit commencer un nouvel "
+                "entraînement et ne peut pas restaurer un réseau CPG."
+            )
+        self.model.load_state_dict(data["model_state_dict"])
+        self.optimizer.load_state_dict(data["optimizer_state_dict"])
+        torch.set_rng_state(data["torch_rng_state"].cpu())
+        self.action_generator.set_state(data["action_generator_state"])
+        self.shuffle_generator.set_state(data["shuffle_generator_state"])
+        self.worlds = [CellWorld3D.from_dict(item) for item in data["worlds"]]
+        self.history = PPOHistory(**data["history"])
+        self.updates = int(data["updates"])
+        self.total_environment_steps = int(data["total_environment_steps"])
+        self.episodes = int(data["episodes"])
+        self.captures = int(data["captures"])
+        last_episode = data.get("last_episode")
+        self.last_episode = (
+            EpisodeMetrics(**last_episode) if isinstance(last_episode, dict) else None
+        )
+        self.last_update = PPOUpdateMetrics(**data["last_update"])
+
+
+class Evaluator3D:
+    def __init__(self, trainer: PPOTrainer3D) -> None:
+        self.trainer = trainer
+        self.generator = torch.Generator(device=trainer.device)
+        self.reset()
+
+    def reset(self) -> None:
+        self.world = CellWorld3D(seed=6060, curriculum_level=2)
+        self.episodes: list[EpisodeMetrics] = []
+        self.generator.manual_seed(6061)
+
+    def step(self, deterministic: bool) -> EpisodeMetrics | None:
+        action = self.trainer.infer(
+            self.world.observations(), self.generator, deterministic
+        )
+        outcome = self.world.step(action, remember_trajectory=True)
+        if outcome.metrics is not None:
+            self.episodes.append(outcome.metrics)
+        return outcome.metrics
+
+    @property
+    def captures(self) -> int:
+        return sum(item.captured for item in self.episodes)
+
+    def success_rate(self) -> float:
+        return self.captures / len(self.episodes) if self.episodes else 0.0
+
+    def average(self, attribute: str) -> float:
+        return (
+            sum(float(getattr(item, attribute)) for item in self.episodes)
+            / len(self.episodes)
+            if self.episodes
+            else 0.0
+        )
+
+
+# ---------------------------------------------------------------------------
+# Interface Tkinter et projection du cube
+# ---------------------------------------------------------------------------
+
+
+class Application:
+    def __init__(self) -> None:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+
+        self.tk = tk
+        self.filedialog = filedialog
+        self.messagebox = messagebox
+        self.root = tk.Tk()
+        self.root.title(
+            "Cellule 3D — PPO Full RN — contrôle direct des 6 articulations"
+        )
+        self.root.geometry(f"{CANVAS_WIDTH}x{CANVAS_HEIGHT + 56}")
+        self.root.minsize(CANVAS_WIDTH, CANVAS_HEIGHT + 56)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.trainer = PPOTrainer3D(seed=1234)
+        self.evaluator = Evaluator3D(self.trainer)
+        self.demo_world = CellWorld3D(seed=9090, curriculum_level=0)
+        self.demo_generator = torch.Generator(device=self.trainer.device)
+        self.demo_generator.manual_seed(9091)
+        self.learning_running = False
+        self.evaluation_running = False
+        self.evaluation_deterministic = False
+        self.training_busy = False
+        self.closed = False
+        self.show_vectors = True
+        self.capture_flash = 0
+        self.view_index = 0
+        self.views = ((-35.0, 24.0), (35.0, 24.0), (-125.0, 22.0), (-35.0, 52.0))
+        self.camera_yaw, self.camera_pitch = self.views[self.view_index]
+        self.camera_zoom = 1.0
+        self.camera_drag_origin: tuple[int, int] | None = None
+        self.camera_drag_angles: tuple[float, float] | None = None
+        # L'entraînement PPO s'exécute sur le thread Tkinter. Une pause entre
+        # deux mises à jour laisse plusieurs images à la démonstration visible.
+        self.cadences = (1, 350, 1000)
+        self.cadence_names = ("MAX", "NORMALE", "LENTE")
+        self.cadence_index = 1
+
+        toolbar = tk.Frame(self.root, bg="#18222f", padx=6, pady=7)
+        toolbar.pack(fill="x")
+        self.start_button = tk.Button(
+            toolbar, text="Démarrer PPO", width=16, command=self.toggle_learning
+        )
+        self.start_button.pack(side="left", padx=2)
+        self.update_button = tk.Button(
+            toolbar, text="1 mise à jour", width=15, command=self.run_one_update
+        )
+        self.update_button.pack(side="left", padx=2)
+        self.evaluation_button = tk.Button(
+            toolbar, text="Évaluer RN", width=14, command=self.start_evaluation
+        )
+        self.evaluation_button.pack(side="left", padx=2)
+        self.evaluation_mode_button = tk.Button(
+            toolbar,
+            text="Test : stochastique",
+            width=19,
+            command=self.toggle_evaluation_mode,
+        )
+        self.evaluation_mode_button.pack(side="left", padx=2)
+        self.cadence_button = tk.Button(
+            toolbar,
+            text="Cadence : NORMALE",
+            width=18,
+            command=self.cycle_cadence,
+        )
+        self.cadence_button.pack(side="left", padx=2)
+        tk.Button(
+            toolbar, text="Vue prédéfinie", width=15, command=self.change_view
+        ).pack(side="left", padx=2)
+        self.vector_button = tk.Button(
+            toolbar, text="Masquer vecteurs", width=16, command=self.toggle_vectors
+        )
+        self.vector_button.pack(side="left", padx=2)
+        tk.Button(
+            toolbar, text="Sauver session", width=15, command=self.save_session
+        ).pack(side="left", padx=2)
+        tk.Button(
+            toolbar, text="Restaurer", width=13, command=self.load_session
+        ).pack(side="left", padx=2)
+        tk.Button(
+            toolbar, text="Réinitialiser", width=13, command=self.reset_network
+        ).pack(side="right", padx=2)
+
+        self.canvas = tk.Canvas(
+            self.root,
+            width=CANVAS_WIDTH,
+            height=CANVAS_HEIGHT,
+            bg="#07111b",
+            highlightthickness=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+        # Les interactions sont limitées à la partie gauche réservée au cube.
+        # Elles changent uniquement la caméra, jamais l'état physique du monde.
+        self.canvas.bind("<ButtonPress-1>", self.begin_camera_drag)
+        self.canvas.bind("<B1-Motion>", self.drag_camera)
+        self.canvas.bind("<ButtonRelease-1>", self.end_camera_drag)
+        self.canvas.bind("<MouseWheel>", self.zoom_camera)
+        self.canvas.bind("<Button-4>", self.zoom_camera)
+        self.canvas.bind("<Button-5>", self.zoom_camera)
+        self.tick()
+        self.training_cycle()
+
+    def close(self) -> None:
+        self.closed = True
+        self.learning_running = False
+        self.root.destroy()
+
+    def toggle_learning(self) -> None:
+        if self.evaluation_running:
+            self.evaluation_running = False
+            self.learning_running = True
+            self.evaluation_button.configure(text="Évaluer RN")
+        else:
+            self.learning_running = not self.learning_running
+        self.start_button.configure(
+            text="Pause PPO" if self.learning_running else "Démarrer PPO"
+        )
+        self.update_button.configure(
+            state="disabled" if self.learning_running else "normal"
+        )
+
+    def run_one_update(self) -> None:
+        if self.training_busy:
+            return
+        self.learning_running = False
+        self.evaluation_running = False
+        self.start_button.configure(text="Démarrer PPO")
+        self.evaluation_button.configure(text="Évaluer RN")
+        self._perform_update()
+
+    def start_evaluation(self) -> None:
+        self.learning_running = False
+        self.evaluation_running = True
+        self.evaluator.reset()
+        self.start_button.configure(text="Reprendre PPO")
+        self.evaluation_button.configure(text="Relancer évaluation")
+        self.update_button.configure(state="disabled")
+
+    def toggle_evaluation_mode(self) -> None:
+        self.evaluation_deterministic = not self.evaluation_deterministic
+        mode = "déterministe" if self.evaluation_deterministic else "stochastique"
+        self.evaluation_mode_button.configure(text=f"Test : {mode}")
+        if self.evaluation_running:
+            self.evaluator.reset()
+
+    def cycle_cadence(self) -> None:
+        self.cadence_index = (self.cadence_index + 1) % len(self.cadences)
+        self.cadence_button.configure(
+            text=f"Cadence : {self.cadence_names[self.cadence_index]}"
+        )
+
+    def change_view(self) -> None:
+        self.view_index = (self.view_index + 1) % len(self.views)
+        self.camera_yaw, self.camera_pitch = self.views[self.view_index]
+
+    @staticmethod
+    def pointer_in_3d_view(event: Any) -> bool:
+        return 0 <= int(event.x) < 885 and 0 <= int(event.y) <= CANVAS_HEIGHT
+
+    def begin_camera_drag(self, event: Any) -> None:
+        if not self.pointer_in_3d_view(event):
+            return
+        self.camera_drag_origin = (int(event.x), int(event.y))
+        self.camera_drag_angles = (self.camera_yaw, self.camera_pitch)
+        self.canvas.configure(cursor="fleur")
+
+    def drag_camera(self, event: Any) -> None:
+        if self.camera_drag_origin is None or self.camera_drag_angles is None:
+            return
+        delta_x = int(event.x) - self.camera_drag_origin[0]
+        delta_y = int(event.y) - self.camera_drag_origin[1]
+        initial_yaw, initial_pitch = self.camera_drag_angles
+        self.camera_yaw = (initial_yaw + 0.35 * delta_x) % 360.0
+        # La limite évite de retourner la caméra et conserve les axes lisibles.
+        self.camera_pitch = clamp(initial_pitch - 0.30 * delta_y, -78.0, 78.0)
+
+    def end_camera_drag(self, _event: Any) -> None:
+        self.camera_drag_origin = None
+        self.camera_drag_angles = None
+        self.canvas.configure(cursor="")
+
+    def zoom_camera(self, event: Any) -> str | None:
+        if not self.pointer_in_3d_view(event):
+            return None
+        # Windows/macOS transmettent delta ; Linux utilise Button-4/Button-5.
+        zoom_in = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
+        factor = 1.10 if zoom_in else 1.0 / 1.10
+        self.camera_zoom = clamp(self.camera_zoom * factor, 1.00, 3.00)
+        return "break"
+
+    def toggle_vectors(self) -> None:
+        self.show_vectors = not self.show_vectors
+        self.vector_button.configure(
+            text="Masquer vecteurs" if self.show_vectors else "Afficher vecteurs"
+        )
+
+    def _perform_update(self) -> None:
+        self.training_busy = True
+        try:
+            self.trainer.ppo_update()
+        except Exception as exc:
+            self.learning_running = False
+            self.start_button.configure(text="Démarrer PPO")
+            self.update_button.configure(state="normal")
+            self.messagebox.showerror("Erreur PPO 3D", str(exc))
+        finally:
+            self.training_busy = False
+
+    def training_cycle(self) -> None:
+        if self.closed:
+            return
+        if self.learning_running and not self.training_busy:
+            self._perform_update()
+        self.root.after(self.cadences[self.cadence_index], self.training_cycle)
+
+    @staticmethod
+    def session_root() -> Path:
+        return Path(__file__).resolve().parent / "sauvegardes_pytorch_3d_full_rn"
+
+    def _history_rows(self) -> list[list[Any]]:
+        history = self.trainer.history
+        length = max(len(history.rewards), len(history.policy_losses), 1)
+        rows: list[list[Any]] = []
+        for index in range(length):
+            def value(values: list[float]) -> float | str:
+                return values[index] if index < len(values) else ""
+
+            rows.append(
+                [
+                    index + 1,
+                    value(history.rewards),
+                    value(history.successes),
+                    value(history.path_efficiencies),
+                    value(history.effective_speeds),
+                    value(history.lateral_motions),
+                    value(history.policy_losses),
+                    value(history.value_losses),
+                    value(history.entropies),
+                    value(history.approximate_kls),
+                    value(history.clip_fractions),
+                ]
+            )
+        return rows
+
+    def save_session(self) -> None:
+        root = self.session_root()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        directory = root / timestamp
+        suffix = 1
+        while directory.exists():
+            directory = root / f"{timestamp}_{suffix:02d}"
+            suffix += 1
+        try:
+            directory.mkdir(parents=True, exist_ok=False)
+            checkpoint = self.trainer.checkpoint()
+            checkpoint["saved_at"] = datetime.now().isoformat(timespec="seconds")
+            checkpoint["demo_world"] = self.demo_world.to_dict()
+            checkpoint["demo_generator_state"] = self.demo_generator.get_state()
+            checkpoint["evaluator_world"] = self.evaluator.world.to_dict()
+            checkpoint["evaluator_episodes"] = [
+                asdict(item) for item in self.evaluator.episodes
+            ]
+            checkpoint["evaluator_generator_state"] = self.evaluator.generator.get_state()
+            checkpoint["application"] = {
+                "cadence_index": self.cadence_index,
+                "show_vectors": self.show_vectors,
+                "evaluation_deterministic": self.evaluation_deterministic,
+                "view_index": self.view_index,
+                "camera_yaw": self.camera_yaw,
+                "camera_pitch": self.camera_pitch,
+                "camera_zoom": self.camera_zoom,
+            }
+            torch.save(checkpoint, directory / SESSION_FILENAME)
+            configuration = {
+                "format": SESSION_FORMAT,
+                "saved_at": checkpoint["saved_at"],
+                "architecture": [OBSERVATION_SIZE, HIDDEN_SIZE, HIDDEN_SIZE, ACTION_SIZE, 1],
+                "actor": "gaussien continu avec tanh",
+                "algorithm": "PPO + GAE",
+                "motor_controller": "six angles articulaires cibles produits directement par le RN",
+                "imposed_wave": False,
+                "goal_reference": "extrémité blanche de la tête",
+                "physics_reference": "centre du corps",
+                "target_radius": TARGET_RADIUS,
+                "contact_rule": "extrémité blanche à l'intérieur de la sphère",
+                "flagellum_segments": SEGMENT_COUNT,
+                "segment_lengths": list(SEGMENT_LENGTHS),
+                "segment_force_weights": list(SEGMENT_FORCE_WEIGHTS),
+                "joint_limits_degrees": [
+                    math.degrees(value) for value in JOINT_LIMITS
+                ],
+                "shape_propulsion": SHAPE_PROPULSION,
+                "joint_servo_gain": JOINT_SERVO_GAIN,
+                "joint_damping": JOINT_DAMPING,
+                "direct_target_retention": DIRECT_TARGET_RETENTION,
+                "abstract_steering_force": 0.0,
+                "alignment_progress_reward": ALIGNMENT_PROGRESS_REWARD,
+                "terminal_guidance_gap": TERMINAL_GUIDANCE_GAP,
+                "terminal_alignment_min_factor": TERMINAL_ALIGNMENT_MIN_FACTOR,
+                "near_miss_max_gap": NEAR_MISS_MAX_GAP,
+                "near_miss_penalty": NEAR_MISS_PENALTY,
+                "overshoot_penalty": OVERSHOOT_PENALTY,
+                "anticipation_max_gap": ANTICIPATION_MAX_GAP,
+                "anticipation_horizon_steps": ANTICIPATION_HORIZON_STEPS,
+                "anticipation_penalty": ANTICIPATION_PENALTY,
+                "orbit_penalty": ORBIT_PENALTY,
+                "orbit_min_head_speed": ORBIT_MIN_HEAD_SPEED,
+                "turn_reward_full_beyond_degrees": 60.0,
+                "turn_reward_zero_below_degrees": 25.0,
+                "stagnation_speed": STAGNATION_SPEED,
+                "stagnation_rotation": STAGNATION_ROTATION,
+                "stagnation_grace_steps": STAGNATION_GRACE_STEPS,
+                "stagnation_penalty": STAGNATION_PENALTY,
+                "joint_axes": 2,
+                "environment_count": ENVIRONMENT_COUNT,
+                "rollout_steps": ROLLOUT_STEPS,
+                "ppo_epochs": PPO_EPOCHS,
+                "learning_rate": LEARNING_RATE,
+            }
+            (directory / CONFIG_FILENAME).write_text(
+                json.dumps(configuration, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with (directory / HISTORY_FILENAME).open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream, delimiter=";")
+                writer.writerow(
+                    [
+                        "index", "reward", "success", "path_efficiency",
+                        "effective_speed", "lateral_motion", "policy_loss",
+                        "value_loss", "entropy", "approximate_kl", "clip_fraction",
+                    ]
+                )
+                writer.writerows(self._history_rows())
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.messagebox.showerror("Sauvegarde impossible", str(exc))
+            return
+        self.messagebox.showinfo(
+            "Session 3D sauvegardée",
+            f"Checkpoint, configuration et historique :\n{directory}",
+        )
+
+    def load_session(self) -> None:
+        root = self.session_root()
+        root.mkdir(parents=True, exist_ok=True)
+        selected = self.filedialog.askdirectory(
+            title="Sélectionner un dossier de session PPO 3D",
+            initialdir=str(root),
+            mustexist=True,
+        )
+        if not selected:
+            return
+        path = Path(selected) / SESSION_FILENAME
+        if not path.is_file():
+            self.messagebox.showerror(
+                "Dossier invalide", f"Le fichier {SESSION_FILENAME} est absent."
+            )
+            return
+        self.learning_running = False
+        self.evaluation_running = False
+        try:
+            try:
+                checkpoint = torch.load(
+                    path, map_location=self.trainer.device, weights_only=True
+                )
+            except TypeError:
+                checkpoint = torch.load(path, map_location=self.trainer.device)
+            if not isinstance(checkpoint, dict):
+                raise ValueError("Checkpoint invalide.")
+            self.trainer.restore_checkpoint(checkpoint)
+            self.demo_world = CellWorld3D.from_dict(checkpoint["demo_world"])
+            self.demo_generator.set_state(checkpoint["demo_generator_state"])
+            self.evaluator = Evaluator3D(self.trainer)
+            self.evaluator.world = CellWorld3D.from_dict(checkpoint["evaluator_world"])
+            self.evaluator.episodes = [
+                EpisodeMetrics(**item)
+                for item in checkpoint.get("evaluator_episodes", [])
+            ]
+            self.evaluator.generator.set_state(checkpoint["evaluator_generator_state"])
+            application = checkpoint.get("application", {})
+            self.cadence_index = int(application.get("cadence_index", 1))
+            self.show_vectors = bool(application.get("show_vectors", True))
+            self.evaluation_deterministic = bool(
+                application.get("evaluation_deterministic", False)
+            )
+            self.view_index = int(application.get("view_index", 0)) % len(self.views)
+            default_yaw, default_pitch = self.views[self.view_index]
+            self.camera_yaw = float(application.get("camera_yaw", default_yaw))
+            self.camera_pitch = clamp(
+                float(application.get("camera_pitch", default_pitch)), -78.0, 78.0
+            )
+            self.camera_zoom = clamp(
+                float(application.get("camera_zoom", 1.0)), 1.00, 3.00
+            )
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError) as exc:
+            self.messagebox.showerror("Restauration impossible", str(exc))
+            return
+
+        self.start_button.configure(text="Démarrer PPO")
+        self.update_button.configure(state="normal")
+        self.evaluation_button.configure(text="Évaluer RN")
+        mode = "déterministe" if self.evaluation_deterministic else "stochastique"
+        self.evaluation_mode_button.configure(text=f"Test : {mode}")
+        self.cadence_button.configure(
+            text=f"Cadence : {self.cadence_names[self.cadence_index]}"
+        )
+        self.vector_button.configure(
+            text="Masquer vecteurs" if self.show_vectors else "Afficher vecteurs"
+        )
+        self.messagebox.showinfo(
+            "Session 3D restaurée",
+            "Réseau, optimiseur, mondes et historiques restaurés.\n"
+            "La session est volontairement en pause.",
+        )
+
+    def reset_network(self) -> None:
+        if not self.messagebox.askyesno(
+            "Réinitialiser PPO 3D",
+            "Effacer les poids, l'optimiseur et toutes les courbes ?",
+        ):
+            return
+        self.learning_running = False
+        self.evaluation_running = False
+        seed = random.randrange(1, 1_000_000)
+        self.trainer = PPOTrainer3D(seed=seed)
+        self.evaluator = Evaluator3D(self.trainer)
+        self.demo_world = CellWorld3D(seed=seed + 2, curriculum_level=0)
+        self.demo_generator = torch.Generator(device=self.trainer.device)
+        self.demo_generator.manual_seed(seed + 3)
+        self.start_button.configure(text="Démarrer PPO")
+        self.update_button.configure(state="normal")
+        self.evaluation_button.configure(text="Évaluer RN")
+
+    def tick(self) -> None:
+        if self.closed:
+            return
+        if self.learning_running and not self.training_busy:
+            self.demo_world.set_curriculum_level(self.trainer.curriculum_level())
+            action = self.trainer.infer(
+                self.demo_world.observations(), self.demo_generator, False
+            )
+            outcome = self.demo_world.step(action, remember_trajectory=True)
+            if outcome.metrics is not None and outcome.metrics.captured:
+                self.capture_flash = 12
+        elif self.evaluation_running:
+            metrics = self.evaluator.step(self.evaluation_deterministic)
+            if metrics is not None and metrics.captured:
+                self.capture_flash = 12
+        if self.capture_flash > 0:
+            self.capture_flash -= 1
+        self.draw()
+        self.root.after(33, self.tick)
+
+    def visible_world(self) -> CellWorld3D:
+        return self.evaluator.world if self.evaluation_running else self.demo_world
+
+    def project(self, point: Vec3) -> tuple[float, float, float]:
+        yaw = math.radians(self.camera_yaw)
+        pitch = math.radians(self.camera_pitch)
+        cosine_yaw, sine_yaw = math.cos(yaw), math.sin(yaw)
+        horizontal_x = cosine_yaw * point.x - sine_yaw * point.y
+        depth_axis = sine_yaw * point.x + cosine_yaw * point.y
+        vertical = math.cos(pitch) * point.z - math.sin(pitch) * depth_axis
+        depth = math.sin(pitch) * point.z + math.cos(pitch) * depth_axis
+        scale = 0.72 * self.camera_zoom
+        return 435.0 + scale * horizontal_x, 372.0 - scale * vertical, depth
+
+    def draw_3d_line(
+        self,
+        start: Vec3,
+        end: Vec3,
+        color: str,
+        width: int = 1,
+        dash: tuple[int, int] | None = None,
+        arrow: str | None = None,
+    ) -> None:
+        x1, y1, _depth1 = self.project(start)
+        x2, y2, _depth2 = self.project(end)
+        self.canvas.create_line(
+            x1, y1, x2, y2, fill=color, width=width, dash=dash, arrow=arrow
+        )
+
+    def draw_cube(self) -> None:
+        c = self.canvas
+        half = WORLD_HALF_SIZE
+        vertices = {
+            (x, y, z): Vec3(x * half, y * half, z * half)
+            for x in (-1, 1)
+            for y in (-1, 1)
+            for z in (-1, 1)
+        }
+        for x in (-1, 1):
+            for y in (-1, 1):
+                self.draw_3d_line(vertices[(x, y, -1)], vertices[(x, y, 1)], "#496476", 2)
+        for z in (-1, 1):
+            for x in (-1, 1):
+                self.draw_3d_line(vertices[(x, -1, z)], vertices[(x, 1, z)], "#496476", 2)
+            for y in (-1, 1):
+                self.draw_3d_line(vertices[(-1, y, z)], vertices[(1, y, z)], "#496476", 2)
+
+        # Deux plans quadrillés donnent la profondeur sans masquer la cellule.
+        for fraction in (-0.5, 0.0, 0.5):
+            coordinate = fraction * 2.0 * half
+            self.draw_3d_line(Vec3(-half, coordinate, -half), Vec3(half, coordinate, -half), "#173247")
+            self.draw_3d_line(Vec3(coordinate, -half, -half), Vec3(coordinate, half, -half), "#173247")
+            self.draw_3d_line(Vec3(-half, half, coordinate), Vec3(half, half, coordinate), "#132b3d")
+            self.draw_3d_line(Vec3(coordinate, half, -half), Vec3(coordinate, half, half), "#132b3d")
+
+        origin = Vec3(-half, -half, -half)
+        axes = ((Vec3(80, 0, 0), "X", "#ff7a7a"), (Vec3(0, 80, 0), "Y", "#76df9b"), (Vec3(0, 0, 80), "Z", "#71b7ff"))
+        for vector, label, color in axes:
+            endpoint = origin + vector
+            self.draw_3d_line(origin, endpoint, color, 2, arrow="last")
+            x, y, _depth = self.project(endpoint)
+            c.create_text(x + 4, y - 4, text=label, fill=color, anchor="sw", font=("Segoe UI", 9, "bold"))
+
+    def draw_vector(self, origin: Vec3, vector: Vec3, color: str, label: str, scale: float) -> None:
+        magnitude = vector.length()
+        if magnitude < 1e-9:
+            return
+        length = min(115.0, max(14.0, magnitude * scale))
+        endpoint = origin + vector.normalized() * length
+        self.draw_3d_line(origin, endpoint, color, 2, arrow="last")
+        x, y, _depth = self.project(endpoint)
+        self.canvas.create_text(x + 4, y - 4, text=label, fill=color, anchor="sw", font=("Segoe UI", 8, "bold"))
+
+    def draw_world(self) -> None:
+        c = self.canvas
+        world = self.visible_world()
+        self.draw_cube()
+
+        # Projection verticale sur le plan inférieur : elle rend la coordonnée
+        # z perceptible même lorsque la trajectoire passe devant les arêtes.
+        for point, color in ((world.cell.position, "#416c78"), (world.target, "#806d39")):
+            floor_point = Vec3(point.x, point.y, -WORLD_HALF_SIZE)
+            self.draw_3d_line(point, floor_point, color, 1, dash=(4, 4))
+
+        if len(world.trajectory) >= 2:
+            projected: list[float] = []
+            for point in world.trajectory:
+                x, y, _depth = self.project(point)
+                projected.extend((x, y))
+            c.create_line(*projected, fill="#718792", width=2, smooth=True)
+
+        target_x, target_y, target_depth = self.project(world.target)
+        depth_scale = clamp(1.0 + target_depth / 1400.0, 0.72, 1.25)
+        target_pixels = TARGET_RADIUS * 0.72 * self.camera_zoom * depth_scale
+        c.create_oval(
+            target_x - target_pixels,
+            target_y - target_pixels,
+            target_x + target_pixels,
+            target_y + target_pixels,
+            fill="#ffffff" if self.capture_flash else "#ffd54f",
+            outline="#fff4b0",
+            width=2,
+        )
+
+        geometry = world.flagellum_geometry()
+        segment_colors = ("#73d7ff", "#4eb7e5", "#329acb")
+        for index in range(SEGMENT_COUNT):
+            self.draw_3d_line(
+                geometry.points[index],
+                geometry.points[index + 1],
+                segment_colors[index],
+                6 - index,
+            )
+        for joint in geometry.points[:-1]:
+            x, y, depth = self.project(joint)
+            radius = clamp(3.5 * (1.0 + depth / 1600.0), 2.5, 5.0)
+            c.create_oval(x - radius, y - radius, x + radius, y + radius, fill="#d9f5ff", outline="#22789c")
+
+        forward = world.body_forward()
+        right = world.cell.orientation.rotate(Vec3(0.0, 1.0, 0.0)).normalized()
+        up = world.cell.orientation.rotate(Vec3(0.0, 0.0, 1.0)).normalized()
+        body_points: list[float] = []
+        for index in range(28):
+            angle = 2.0 * math.pi * index / 28
+            point = (
+                world.cell.position
+                + forward * (BODY_HALF_LENGTH * math.cos(angle))
+                + right * (BODY_RADIUS * math.sin(angle))
+            )
+            x, y, _depth = self.project(point)
+            body_points.extend((x, y))
+        c.create_polygon(*body_points, fill="#67d8a2", outline="#d8ffea", width=2, smooth=True)
+        self.draw_3d_line(
+            world.cell.position - forward * BODY_HALF_LENGTH,
+            world.cell.position + forward * BODY_HALF_LENGTH,
+            "#d8ffea",
+            2,
+        )
+        self.draw_3d_line(
+            world.cell.position - up * BODY_RADIUS,
+            world.cell.position + up * BODY_RADIUS,
+            "#3b8e6a",
+            1,
+        )
+
+        # La pointe blanche est l'effecteur réellement utilisé pour le guidage,
+        # la progression et le contact avec la sphère cible.
+        head_x, head_y, head_depth = self.project(world.head_position())
+        head_radius = clamp(4.0 * (1.0 + head_depth / 1600.0), 3.0, 5.5)
+        c.create_oval(
+            head_x - head_radius,
+            head_y - head_radius,
+            head_x + head_radius,
+            head_y + head_radius,
+            fill="#ffffff",
+            outline="#2d7f60",
+            width=2,
+        )
+
+        telemetry = world.telemetry
+        # Le segment orange relie la pointe au centre de la cible. Sa longueur
+        # moins TARGET_RADIUS donne la marge réelle avant le contact.
+        self.draw_3d_line(
+            telemetry.contact_point,
+            world.target,
+            "#ff9f43",
+            2,
+            dash=(3, 3),
+        )
+        if self.show_vectors:
+            force_colors = ("#ffad58", "#ff825e", "#ff5f79")
+            for index, (middle, force) in enumerate(zip(geometry.middles, telemetry.segment_forces)):
+                self.draw_vector(middle, force, force_colors[index], f"F{index + 1}", 480.0)
+            self.draw_vector(world.cell.position, telemetry.propulsion, "#46e66d", "PROP", 90.0)
+            self.draw_vector(world.cell.position, telemetry.velocity, "#48a9ff", "V CENTRE", 48.0)
+            self.draw_vector(world.head_position(), telemetry.head_velocity, "#73dfff", "V TÊTE", 48.0)
+            self.draw_vector(telemetry.contact_point, telemetry.target_direction, "#cf8cff", "CIBLE", 78.0)
+            self.draw_vector(world.cell.position, telemetry.torque, "#ffcf67", "τ", 2.0)
+
+        c.create_text(
+            24,
+            CANVAS_HEIGHT - 16,
+            text="Glisser : rotation libre   Molette : zoom   Vue prédéfinie : cadrage   F1/F2/F3 : forces   τ : couple",
+            anchor="sw",
+            fill="#a9bbc6",
+            font=("Segoe UI", 9),
+        )
+
+    def draw_statistics(self) -> None:
+        c = self.canvas
+        world = self.visible_world()
+        telemetry = world.telemetry
+        left, top, right, bottom = 895, 18, 1385, 912
+        c.create_rectangle(left, top, right, bottom, fill="#0c1722", outline="#38566b", width=2)
+        if self.learning_running:
+            state, color = "APPRENTISSAGE PPO 3D", "#66e58a"
+        elif self.evaluation_running:
+            mode = "DÉTERMINISTE" if self.evaluation_deterministic else "STOCHASTIQUE"
+            state, color = f"ÉVALUATION {mode}", "#62c8ff"
+        else:
+            state, color = "PAUSE — MONDE FIGÉ", "#ffca5c"
+        c.create_text((left + right) * 0.5, top + 23, text="ACTOR-CRITIC — FULL RN", fill="#e9f4fa", font=("Segoe UI", 11, "bold"))
+        c.create_text((left + right) * 0.5, top + 49, text=state, fill=color, font=("Segoe UI", 9, "bold"))
+
+        update = self.trainer.last_update
+        level = self.trainer.curriculum_level()
+        ppo_info = (
+            f"Niveau     : {level + 1}/3\n"
+            f"{CURRICULUM_NAMES[level]}\n"
+            f"Mondes/Lot : {ENVIRONMENT_COUNT} / {ENVIRONMENT_COUNT * ROLLOUT_STEPS}\n"
+            f"MAJ / Pas  : {self.trainer.updates} / {self.trainer.total_environment_steps}\n"
+            f"Poursuites : {self.trainer.episodes}   Captures : {self.trainer.captures}\n"
+            f"Réussite20 : {100*self.trainer.success_rate():5.1f}%\n"
+            f"Actor/Critic: {update.policy_loss:+.5f} / {update.value_loss:.5f}\n"
+            f"Entropie/KL: {update.entropy:.4f} / {update.approximate_kl:.5f}"
+        )
+        c.create_text(left + 16, top + 69, text=ppo_info, anchor="nw", fill="#d8e7ef", font=("Consolas", 12))
+
+        action = telemetry.action
+        target_degrees = [
+            math.degrees(action[2 * joint + axis] * JOINT_LIMITS[joint])
+            for joint in range(SEGMENT_COUNT)
+            for axis in range(2)
+        ]
+        actual_degrees = [
+            math.degrees(world.cell.joint_angles[joint][axis])
+            for joint in range(SEGMENT_COUNT)
+            for axis in range(2)
+        ]
+        movement_info = (
+            f"CELLULE AFFICHÉE\n"
+            f"Pos. X/Y/Z : {world.cell.position.x:+6.1f} "
+            f"{world.cell.position.y:+6.1f} {world.cell.position.z:+6.1f}\n"
+            f"Vit. centre/tête: {world.cell.velocity.length():.3f} / "
+            f"{telemetry.head_velocity.length():.3f}\n"
+            f"Align./rotation : {telemetry.alignment:+.3f} / "
+            f"{world.cell.angular_velocity.length():.4f}\n"
+            f"CIBLES RN / ANGLES RÉELS (Y/P)\n"
+            f"J1 : {target_degrees[0]:+5.1f}/{target_degrees[1]:+5.1f} | "
+            f"{actual_degrees[0]:+5.1f}/{actual_degrees[1]:+5.1f}\n"
+            f"J2 : {target_degrees[2]:+5.1f}/{target_degrees[3]:+5.1f} | "
+            f"{actual_degrees[2]:+5.1f}/{actual_degrees[3]:+5.1f}\n"
+            f"J3 : {target_degrees[4]:+5.1f}/{target_degrees[5]:+5.1f} | "
+            f"{actual_degrees[4]:+5.1f}/{actual_degrees[5]:+5.1f}"
+        )
+        c.create_text(left + 16, top + 250, text=movement_info, anchor="nw", fill="#c5e3ef", font=("Consolas", 12))
+
+        diagnostic_top = top + 412
+        diagnostic_bottom = top + 787
+        c.create_rectangle(
+            left + 8,
+            diagnostic_top,
+            right - 8,
+            diagnostic_bottom,
+            fill="#111d28",
+            outline="#ff9f43" if telemetry.near_miss else "#47677a",
+            width=2,
+        )
+        c.create_text(
+            (left + right) * 0.5,
+            diagnostic_top + 16,
+            text="DIAGNOSTIC FIN DE PARCOURS",
+            fill="#ffb463",
+            font=("Segoe UI", 8, "bold"),
+        )
+        diagnostic_info = (
+            f"Dist. centre → cible : {telemetry.center_distance:8.3f}\n"
+            f"Dist. pointe → cible : {telemetry.tip_distance:8.3f}\n"
+            f"Angle axe → cible    : {telemetry.bearing_degrees:7.2f}°\n"
+            f"Marge de contact     : {telemetry.contact_gap:+8.3f}\n"
+            f"Prog. centre/pointe  : {telemetry.center_progress:+.4f} / "
+            f"{telemetry.tip_progress:+.4f}\n"
+            f"Prog. contact        : {telemetry.contact_progress:+.4f}\n"
+            f"V. radiale/lat.      : {telemetry.radial_speed:+.4f} / "
+            f"{telemetry.lateral_speed:.4f}\n"
+            f"Fraction tangentielle: {telemetry.tangential_fraction:.3f}\n"
+            f"Temps avant contact  : {telemetry.time_to_contact:7.2f} pas\n"
+            f"Risque anticipé      : {telemetry.anticipation_risk:.3f}\n"
+            f"Derrière/Raté : {'OUI' if telemetry.target_behind else 'NON'} / "
+            f"{'OUI' if telemetry.near_miss else 'NON'}\n"
+            f"R progression        : {telemetry.reward_progress:+.5f}\n"
+            f"R anticipation       : {telemetry.reward_anticipation:+.5f}\n"
+            f"R align./orbite : {telemetry.reward_alignment:+.4f} / "
+            f"{telemetry.reward_orbit:+.4f}\n"
+            f"R raté/éloign.  : {telemetry.reward_near_miss:+.4f} / "
+            f"{telemetry.reward_overshoot:+.4f}\n"
+            f"R temps/énergie : {telemetry.reward_time:+.4f} / "
+            f"{telemetry.reward_energy:+.4f}\n"
+            f"R total              : {telemetry.reward:+.5f}"
+        )
+        c.create_text(
+            left + 17,
+            diagnostic_top + 34,
+            text=diagnostic_info,
+            anchor="nw",
+            fill="#f0dcc5",
+            font=("Consolas", 12),
+        )
+
+        if self.evaluation_running:
+            evaluation_info = (
+                f"ÉVALUATION — POIDS FIGÉS\n"
+                f"Poursuites/Réussites : {len(self.evaluator.episodes)} / "
+                f"{self.evaluator.captures}\n"
+                f"Taux/Pas moyens      : {100*self.evaluator.success_rate():5.1f}% / "
+                f"{self.evaluator.average('steps'):.1f}\n"
+                f"V.eff./Eff. trajet   : {self.evaluator.average('effective_speed'):.4f} / "
+                f"{self.evaluator.average('path_efficiency'):.3f}"
+            )
+        elif self.trainer.last_episode is None:
+            evaluation_info = "DERNIÈRE POURSUITE\nEn attente"
+        else:
+            last = self.trainer.last_episode
+            evaluation_info = (
+                f"DERNIÈRE POURSUITE\n"
+                f"Résultat/Récompense : {'SUCCÈS' if last.captured else 'ÉCHEC'} / "
+                f"{last.reward:+.3f}\n"
+                f"Pas/V.effective     : {last.steps} / {last.effective_speed:.4f}\n"
+                f"Efficacité          : {last.path_efficiency:.3f}"
+            )
+        c.create_text(left + 16, top + 804, text=evaluation_info, anchor="nw", fill="#d9c8f3", font=("Consolas", 12))
+
+    def draw(self) -> None:
+        self.canvas.delete("all")
+        self.draw_world()
+        self.draw_statistics()
+        history = self.trainer.history
+        self.draw_chart(
+            1397, 18, 1750, 232, "RÉCOMPENSE",
+            (("récompense", history.rewards, "#78909c"), ("moyenne 20", moving_average(history.rewards, 20), "#62df79")),
+        )
+        self.draw_chart(
+            1397, 244, 1750, 458, "PERTES PPO",
+            (("Actor", history.policy_losses, "#47b7ff"), ("Critic", history.value_losses, "#ffad4d")),
+            include_zero=True,
+        )
+        self.draw_chart(
+            1397, 470, 1750, 684, "EFFICACITÉ / SUCCÈS",
+            (("trajet", history.path_efficiencies, "#d58cff"), ("succès 20", moving_average(history.successes, 20), "#ffe066")),
+            fixed_minimum=0.0,
+            fixed_maximum=1.0,
+        )
+        normalized_kl = [min(1.0, value / TARGET_KL) for value in history.approximate_kls]
+        self.draw_chart(
+            1397, 696, 1750, 912, "SANTÉ PPO",
+            (("KL/cible", normalized_kl, "#ff7a90"), ("clip", history.clip_fractions, "#a98cff")),
+            fixed_minimum=0.0,
+            fixed_maximum=1.0,
+        )
+
+    def draw_chart(
+        self,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+        title: str,
+        series: tuple[tuple[str, list[float], str], ...],
+        include_zero: bool = False,
+        fixed_minimum: float | None = None,
+        fixed_maximum: float | None = None,
+    ) -> None:
+        c = self.canvas
+        c.create_rectangle(left, top, right, bottom, fill="#0c1722", outline="#38566b", width=2)
+        c.create_text((left + right) * 0.5, top + 17, text=title, fill="#e9f4fa", font=("Segoe UI", 9, "bold"))
+        visible = [(name, values[-180:], color) for name, values, color in series]
+        all_values = [value for _name, values, _color in visible for value in values]
+        plot_left, plot_right = left + 34, right - 10
+        plot_top, plot_bottom = top + 46, bottom - 30
+        c.create_line(plot_left, plot_top, plot_left, plot_bottom, fill="#607d8b")
+        c.create_line(plot_left, plot_bottom, plot_right, plot_bottom, fill="#607d8b")
+        if not all_values:
+            c.create_text((plot_left + plot_right) * 0.5, (plot_top + plot_bottom) * 0.5, text="En attente de données", fill="#68808d", font=("Segoe UI", 8))
+            return
+        minimum = fixed_minimum if fixed_minimum is not None else min(all_values)
+        maximum = fixed_maximum if fixed_maximum is not None else max(all_values)
+        if include_zero:
+            minimum = min(minimum, 0.0)
+            maximum = max(maximum, 0.0)
+        if abs(maximum - minimum) < 1e-12:
+            maximum += 0.5
+            minimum -= 0.5
+        c.create_text(plot_left - 4, plot_top, text=f"{maximum:.3g}", anchor="e", fill="#8fa9b8", font=("Consolas", 7))
+        c.create_text(plot_left - 4, plot_bottom, text=f"{minimum:.3g}", anchor="e", fill="#8fa9b8", font=("Consolas", 7))
+        legend_x = left + 8
+        for name, values, color in visible:
+            if len(values) == 1:
+                x_values = [plot_left]
+            else:
+                x_values = [
+                    plot_left + index * (plot_right - plot_left) / (len(values) - 1)
+                    for index in range(len(values))
+                ]
+            points: list[float] = []
+            for x_value, value in zip(x_values, values):
+                y_value = plot_bottom - ((value - minimum) / (maximum - minimum)) * (plot_bottom - plot_top)
+                points.extend((x_value, y_value))
+            if len(points) >= 4:
+                c.create_line(*points, fill=color, width=2, smooth=True)
+            elif points:
+                c.create_oval(points[0] - 2, points[1] - 2, points[0] + 2, points[1] + 2, fill=color, outline="")
+            c.create_text(legend_x, bottom - 14, text=name, anchor="w", fill=color, font=("Segoe UI", 7))
+            legend_x += max(58, len(name) * 6 + 12)
+
+
+# ---------------------------------------------------------------------------
+# Tests et exécution
+# ---------------------------------------------------------------------------
+
+
+def test_physics() -> None:
+    world = CellWorld3D(seed=123, curriculum_level=2)
+    rng = random.Random(456)
+    origin = Vec3()
+    for _ in range(8000):
+        action = [rng.uniform(-1.0, 1.0) for _ in range(ACTION_SIZE)]
+        world.step(action, remember_trajectory=False)
+    observations = world.observations()
+    assert len(observations) == OBSERVATION_SIZE
+    assert all(math.isfinite(value) for value in observations)
+
+    # L'anticipation ne punit ni une approche lointaine ni un éloignement,
+    # mais devient active lorsque le temps avant contact devient trop court.
+    far_time, far_risk = contact_anticipation(40.0, 1.0)
+    near_time, near_risk = contact_anticipation(9.0, 1.0)
+    outward_time, outward_risk = contact_anticipation(9.0, -1.0)
+    assert far_time == 40.0 and far_risk == 0.0
+    assert near_time == 9.0 and near_risk > 0.0
+    assert outward_time == 999.9 and outward_risk == 0.0
+
+    # Régression géométrique du contact pointe-sphère. Le point blanc est situé
+    # à BODY_HALF_LENGTH devant le centre et le contact survient sur le rayon.
+    contact_world = CellWorld3D(seed=125, curriculum_level=2)
+    contact_world.cell.position = Vec3()
+    contact_world.cell.orientation = Quaternion()
+    contact_world.target = Vec3(BODY_HALF_LENGTH + TARGET_RADIUS, 0.0, 0.0)
+    frontal_contact = contact_world.contact_geometry()
+    assert abs(frontal_contact.gap) < 1e-9
+    assert (
+        frontal_contact.point - Vec3(BODY_HALF_LENGTH, 0.0, 0.0)
+    ).length() < 1e-9
+    contact_world.target = Vec3(BODY_HALF_LENGTH, TARGET_RADIUS, 0.0)
+    lateral_contact = contact_world.contact_geometry()
+    assert abs(lateral_contact.gap) < 1e-9
+    assert (
+        lateral_contact.point - Vec3(BODY_HALF_LENGTH, 0.0, 0.0)
+    ).length() < 1e-9
+    contact_world.target = Vec3(
+        BODY_HALF_LENGTH,
+        TARGET_RADIUS + 5.0,
+        0.0,
+    )
+    assert abs(contact_world.contact_geometry().gap - 5.0) < 1e-9
+
+    # Régression du repère d'objectif : une rotation pure ne déplace pas le
+    # centre, mais doit réduire la distance fonctionnelle lorsque la tête se
+    # redresse vers une cible latérale.
+    head_reference_world = CellWorld3D(seed=124, curriculum_level=2)
+    head_reference_world.cell.position = Vec3()
+    head_reference_world.target = Vec3(0.0, 100.0, 0.0)
+    center_distance_before = (
+        head_reference_world.target - head_reference_world.cell.position
+    ).length()
+    head_distance_before = head_reference_world.distance_to_target()
+    head_reference_world.cell.orientation = Quaternion.from_axis_angle(
+        Vec3(0.0, 0.0, 1.0), math.pi / 2.0
+    )
+    center_distance_after = (
+        head_reference_world.target - head_reference_world.cell.position
+    ).length()
+    head_distance_after = head_reference_world.distance_to_target()
+    assert abs(center_distance_after - center_distance_before) < 1e-12
+    assert head_distance_after < head_distance_before
+
+    assert abs(world.cell.orientation.normalized().w - world.cell.orientation.w) < 1e-9
+    for index, angles in enumerate(world.cell.joint_angles):
+        assert all(abs(value) <= JOINT_LIMITS[index] + 1e-12 for value in angles)
+    geometry = world.flagellum_geometry()
+    assert len(geometry.points) == SEGMENT_COUNT + 1
+    assert len(geometry.middles) == SEGMENT_COUNT
+    for index, expected_length in enumerate(SEGMENT_LENGTHS):
+        measured_length = (geometry.points[index + 1] - geometry.points[index]).length()
+        assert abs(measured_length - expected_length) < 1e-9
+    restored = CellWorld3D.from_dict(world.to_dict())
+    assert restored.to_dict() == world.to_dict()
+
+    # Générateur utilisé uniquement par ce banc de test. Il prouve que les six
+    # commandes directes peuvent physiquement créer une propulsion et un virage ;
+    # cette séquence n'existe jamais dans l'environnement d'apprentissage.
+    def direct_cycle(
+        step_index: int,
+        yaw_bias: float = 0.0,
+        pitch_bias: float = 0.0,
+        oscillation_yaw: float = 1.0,
+        oscillation_pitch: float = 0.0,
+    ) -> list[float]:
+        phase = 2.0 * math.pi * step_index / 36.0
+        bias_profile = (0.25, 0.60, 1.00)
+        result: list[float] = []
+        for segment_index, bias_weight in enumerate(bias_profile):
+            local_phase = phase - segment_index * math.pi / 2.0
+            result.extend(
+                (
+                    clamp(
+                        oscillation_yaw * math.sin(local_phase)
+                        + bias_weight * yaw_bias,
+                        -1.0,
+                        1.0,
+                    ),
+                    clamp(
+                        oscillation_pitch * math.sin(local_phase)
+                        + bias_weight * pitch_bias,
+                        -1.0,
+                        1.0,
+                    ),
+                )
+            )
+        return result
+
+    # Six cibles nulles maintiennent les articulations au repos : le moteur
+    # Full RN ne contient aucune amplitude ni vitesse minimale cachée.
+    static_world = CellWorld3D(seed=789, curriculum_level=0)
+    static_world._apply_boundaries = lambda: (False, Vec3())  # type: ignore[method-assign]
+    for _ in range(300):
+        static_world.step([0.0] * ACTION_SIZE, remember_trajectory=False)
+    assert all(
+        abs(speed) < 1e-12
+        for pair in static_world.cell.joint_speeds
+        for speed in pair
+    )
+    assert static_world.telemetry.propulsion.length() < 1e-12
+    assert static_world.cell.velocity.length() < 1e-12
+
+    # Une boucle non réciproque injectée par le test produit une poussée. Cela
+    # valide la physique accessible au RN, sans imposer cette boucle au RN.
+    cycle_world = CellWorld3D(seed=790, curriculum_level=0)
+    cycle_world._apply_boundaries = lambda: (False, Vec3())  # type: ignore[method-assign]
+    cycle_speeds: list[float] = []
+    cycle_forward_speeds: list[float] = []
+    cycle_path_length = 0.0
+    previous_cycle_position = Vec3()
+    for step_index in range(500):
+        cycle_world.step(direct_cycle(step_index), remember_trajectory=False)
+        cycle_path_length += (
+            cycle_world.cell.position - previous_cycle_position
+        ).length()
+        previous_cycle_position = Vec3(
+            cycle_world.cell.position.x,
+            cycle_world.cell.position.y,
+            cycle_world.cell.position.z,
+        )
+        if step_index >= 300:
+            cycle_speeds.append(cycle_world.cell.velocity.length())
+            cycle_forward_speeds.append(
+                cycle_world.cell.velocity.dot(cycle_world.body_forward())
+            )
+    mean_cycle_speed = sum(cycle_speeds) / len(cycle_speeds)
+    mean_forward_speed = sum(cycle_forward_speeds) / len(cycle_forward_speeds)
+    cycle_efficiency = cycle_world.cell.position.length() / cycle_path_length
+    assert mean_cycle_speed > 0.70
+    assert mean_forward_speed > 0.55
+    assert cycle_efficiency > 0.70
+
+    # Une asymétrie des angles directs doit orienter le corps dans les deux plans.
+    yaw_world = CellWorld3D(seed=791, curriculum_level=0)
+    yaw_world._apply_boundaries = lambda: (False, Vec3())  # type: ignore[method-assign]
+    pitch_world = CellWorld3D(seed=792, curriculum_level=0)
+    pitch_world._apply_boundaries = lambda: (False, Vec3())  # type: ignore[method-assign]
+    for step_index in range(150):
+        yaw_world.step(direct_cycle(step_index, yaw_bias=-0.50), False)
+        pitch_world.step(
+            direct_cycle(
+                step_index,
+                pitch_bias=0.50,
+                oscillation_yaw=0.0,
+                oscillation_pitch=1.0,
+            ),
+            False,
+        )
+    assert yaw_world.body_forward().y > 0.40
+    assert pitch_world.body_forward().z > 0.40
+
+    # Régression du signal d'apprentissage : à physique identique et pour une
+    # cible placée sur la droite, tourner la tête vers elle doit rapporter
+    # davantage que tourner dans la direction opposée. Ce test ne pilote pas
+    # la cellule vers la cible : il vérifie uniquement la récompense fournie au
+    # futur apprentissage Actor-Critic.
+    steering_rewards: dict[float, float] = {}
+    for steering_sign in (1.0, -1.0):
+        steering_world = CellWorld3D(seed=793, curriculum_level=2)
+        steering_world.target = Vec3(0.0, 220.0, 0.0)
+        steering_world.previous_distance = steering_world.distance_to_target()
+        steering_world.initial_distance = steering_world.previous_distance
+        steering_rewards[steering_sign] = 0.0
+        for step_index in range(150):
+            steering_rewards[steering_sign] += steering_world.step(
+                direct_cycle(step_index, yaw_bias=-0.50 * steering_sign),
+                False,
+            ).reward
+    assert steering_rewards[1.0] > steering_rewards[-1.0] + 0.20
+
+    # Cas de régression observé dans l'IHM : après avoir dépassé la cible, une
+    # amorce de demi-tour doit être plus rentable que couper le flagelle. Les
+    # deux mondes commencent dans un état strictement identique, cible derrière.
+    behind_rewards: dict[str, float] = {}
+    for command_name in ("stop", "turn"):
+        behind_world = CellWorld3D(seed=794, curriculum_level=2)
+        behind_world.target = Vec3(-220.0, 0.0, 0.0)
+        behind_world.previous_distance = behind_world.distance_to_target()
+        behind_world.initial_distance = behind_world.previous_distance
+        behind_rewards[command_name] = 0.0
+        for step_index in range(200):
+            command = (
+                [0.0] * ACTION_SIZE
+                if command_name == "stop"
+                else direct_cycle(step_index, yaw_bias=-0.50)
+            )
+            behind_rewards[command_name] += behind_world.step(
+                command, False
+            ).reward
+    # Le demi-tour reste préférable, sans exiger l'ancienne marge de 0,20 :
+    # la progression de contact punit désormais correctement l'arc initial.
+    assert behind_rewards["turn"] > behind_rewards["stop"] + 0.03
+    assert turning_reward_gate(-1.0) == 1.0
+    assert turning_reward_gate(1.0) == 0.0
+
+    # Deux cibles axiales prouvent que la pointe peut réellement atteindre la
+    # sphère avec les commandes directes. La poursuite 3D reste à apprendre.
+    axial_captures = 0
+    axial_steps: list[int] = []
+    for target_x in (120.0, 150.0):
+        axial_world = CellWorld3D(800 + int(target_x), curriculum_level=0)
+        axial_world._apply_boundaries = lambda: (False, Vec3())  # type: ignore[method-assign]
+        axial_world.target = Vec3(target_x, 0.0, 0.0)
+        axial_world.previous_distance = axial_world.distance_to_target()
+        axial_world.initial_distance = axial_world.previous_distance
+        for axial_step in range(600):
+            axial_outcome = axial_world.step(direct_cycle(axial_step), False)
+            if axial_outcome.terminal:
+                break
+        if axial_outcome.metrics is not None and axial_outcome.metrics.captured:
+            axial_captures += 1
+            axial_steps.append(axial_step + 1)
+    assert axial_captures == 2
+    mean_axial_steps = sum(axial_steps) / len(axial_steps)
+
+    displacement = (world.cell.position - origin).length()
+    print(
+        "PHYSIQUE 3D OK "
+        f"pas={world.total_steps} déplacement={displacement:.2f} "
+        f"cycle_test={mean_cycle_speed:.2f} avant={mean_forward_speed:.2f} "
+        f"efficacité={cycle_efficiency:.2f} "
+        f"cibles_axiales={axial_captures}/2 ({mean_axial_steps:.0f} pas) "
+        f"position=({world.cell.position.x:.1f}, {world.cell.position.y:.1f}, {world.cell.position.z:.1f})"
+    )
+
+
+def run_headless(update_count: int) -> None:
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch est requis : py -m pip install torch")
+    trainer = PPOTrainer3D(seed=1234)
+    for index in range(update_count):
+        metrics = trainer.ppo_update()
+        print(
+            f"MAJ {index + 1:4d} niveau={trainer.curriculum_level() + 1}/3 "
+            f"pas={trainer.total_environment_steps:8d} épisodes={trainer.episodes:5d} "
+            f"succès20={100*trainer.success_rate():5.1f}% "
+            f"actor={metrics.policy_loss:+.5f} critic={metrics.value_loss:.5f} "
+            f"KL={metrics.approximate_kl:.5f}"
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--headless",
+        type=int,
+        metavar="MISES_A_JOUR",
+        help="entraîne sans IHM pendant ce nombre de mises à jour PPO",
+    )
+    parser.add_argument(
+        "--test-physique",
+        action="store_true",
+        help="teste le moteur 3D sans exiger PyTorch",
+    )
+    arguments = parser.parse_args()
+    if arguments.test_physique:
+        test_physics()
+        return
+    if not TORCH_AVAILABLE:
+        message = (
+            "PyTorch est nécessaire pour cette version.\n"
+            "Installez-le avec :\n\n"
+            "    py -m pip install torch\n\n"
+            f"Détail : {TORCH_IMPORT_ERROR}"
+        )
+        print(message, file=sys.stderr)
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("PyTorch absent", message)
+            root.destroy()
+        except Exception:
+            pass
+        raise SystemExit(1)
+    if arguments.headless is not None:
+        run_headless(max(0, arguments.headless))
+        return
+    application = Application()
+    application.root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+{
+  "format": "cellule-ppo-pytorch-v1",
+  "saved_at": "2026-08-07T23:16:19",
+  "architecture": [
+    11,
+    64,
+    64,
+    9,
+    1
+  ],
+  "algorithm": "PPO + GAE",
+  "environment_count": 12,
+  "rollout_steps": 96,
+  "batch_size": 1152,
+  "ppo_epochs": 4,
+  "minibatch_size": 256,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "ppo_clip": 0.2,
+  "learning_rate": 0.0003,
+  "device": "cpu"
+}

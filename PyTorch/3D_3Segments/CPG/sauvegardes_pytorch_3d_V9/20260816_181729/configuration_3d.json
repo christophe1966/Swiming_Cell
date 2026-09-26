@@ -1,0 +1,62 @@
+{
+  "format": "cellule-ppo-pytorch-3d-v6-tip-contact",
+  "saved_at": "2026-08-16T18:17:29",
+  "architecture": [
+    30,
+    128,
+    128,
+    6,
+    1
+  ],
+  "actor": "gaussien continu avec tanh",
+  "algorithm": "PPO + GAE",
+  "motor_controller": "onde progressive CPG pilotée par le RN",
+  "goal_reference": "extrémité blanche de la tête",
+  "physics_reference": "centre du corps",
+  "target_radius": 11.0,
+  "contact_rule": "extrémité blanche à l'intérieur de la sphère",
+  "flagellum_segments": 3,
+  "segment_lengths": [
+    39.0,
+    32.0,
+    25.0
+  ],
+  "segment_force_weights": [
+    1.0,
+    0.78,
+    0.58
+  ],
+  "joint_limits_degrees": [
+    25.0,
+    35.0,
+    40.0
+  ],
+  "shape_propulsion": 3.2,
+  "wave_phase_lag_degrees": 90.0,
+  "wave_ellipticity_max": 0.55,
+  "wave_frequency_variation": 0.25,
+  "joint_servo_gain": 0.28,
+  "joint_damping": 0.6,
+  "steering_force": 0.16,
+  "cpg_control_retention": 0.9,
+  "alignment_progress_reward": 0.8,
+  "terminal_guidance_gap": 90.0,
+  "terminal_alignment_min_factor": 0.25,
+  "near_miss_max_gap": 30.0,
+  "near_miss_penalty": 0.05,
+  "overshoot_penalty": 0.006,
+  "orbit_penalty": 0.004,
+  "orbit_min_head_speed": 0.02,
+  "steering_energy_weight": 0.15,
+  "turn_reward_full_beyond_degrees": 60.0,
+  "turn_reward_zero_below_degrees": 25.0,
+  "stagnation_speed": 0.035,
+  "stagnation_rotation": 0.0025,
+  "stagnation_grace_steps": 36,
+  "stagnation_penalty": 0.008,
+  "joint_axes": 2,
+  "environment_count": 12,
+  "rollout_steps": 96,
+  "ppo_epochs": 4,
+  "learning_rate": 0.0003
+}

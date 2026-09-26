@@ -1,0 +1,53 @@
+{
+  "format": "cellule-ppo-pytorch-3d-v3-head-goal",
+  "saved_at": "2026-08-15T17:50:45",
+  "architecture": [
+    29,
+    128,
+    128,
+    6,
+    1
+  ],
+  "actor": "gaussien continu avec tanh",
+  "algorithm": "PPO + GAE",
+  "motor_controller": "onde progressive CPG pilotée par le RN",
+  "goal_reference": "extrémité avant de la tête",
+  "physics_reference": "centre du corps",
+  "capture_radius": 11.0,
+  "flagellum_segments": 3,
+  "segment_lengths": [
+    39.0,
+    32.0,
+    25.0
+  ],
+  "segment_force_weights": [
+    1.0,
+    0.78,
+    0.58
+  ],
+  "joint_limits_degrees": [
+    25.0,
+    35.0,
+    40.0
+  ],
+  "shape_propulsion": 3.2,
+  "wave_phase_lag_degrees": 90.0,
+  "wave_ellipticity_max": 0.55,
+  "wave_frequency_variation": 0.25,
+  "joint_servo_gain": 0.28,
+  "joint_damping": 0.6,
+  "steering_force": 0.16,
+  "cpg_control_retention": 0.9,
+  "alignment_progress_reward": 0.8,
+  "turn_reward_full_beyond_degrees": 60.0,
+  "turn_reward_zero_below_degrees": 25.0,
+  "stagnation_speed": 0.035,
+  "stagnation_rotation": 0.0025,
+  "stagnation_grace_steps": 36,
+  "stagnation_penalty": 0.008,
+  "joint_axes": 2,
+  "environment_count": 12,
+  "rollout_steps": 96,
+  "ppo_epochs": 4,
+  "learning_rate": 0.0003
+}
